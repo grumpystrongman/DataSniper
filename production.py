@@ -13,6 +13,7 @@ import zipfile
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from fastapi import Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -69,12 +70,45 @@ def rate_limited(request: Request) -> bool:
     return len(failures[key]) >= MAX_FAILURES
 
 
+def normalized_origin(value: str) -> str:
+    value = value.strip().rstrip("/")
+    if not value:
+        return ""
+    parsed = urlsplit(value)
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return f"{parsed.scheme.lower()}://{parsed.netloc.lower()}"
+
+
 def same_origin(request: Request) -> bool:
-    origin = request.headers.get("origin")
+    origin = normalized_origin(request.headers.get("origin", ""))
     if not origin:
         return True
-    host = request.headers.get("host", "")
-    return origin in {f"http://{host}", f"https://{host}"}
+
+    allowed = {
+        normalized_origin(value)
+        for value in os.environ.get("DATASNIPER_ALLOWED_ORIGINS", "").split(",")
+        if value.strip()
+    }
+
+    hosts = {
+        request.headers.get("host", ""),
+        *request.headers.get("x-forwarded-host", "").split(","),
+    }
+    protocols = {
+        request.url.scheme,
+        *request.headers.get("x-forwarded-proto", "").split(","),
+    }
+    for host in hosts:
+        host = host.strip()
+        if not host:
+            continue
+        for protocol in protocols | {"http", "https"}:
+            candidate = normalized_origin(f"{protocol.strip()}://{host}")
+            if candidate:
+                allowed.add(candidate)
+
+    return origin in allowed
 
 
 class SecurityMiddleware(BaseHTTPMiddleware):
