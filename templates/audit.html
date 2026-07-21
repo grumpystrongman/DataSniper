@@ -1,0 +1,4 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card"><h1>Activity history</h1><p class="muted">A local record of what the agent prepared and what you approved.</p>{% for event in events %}<div class="task-row"><div><strong>{{ event.event_type.replace('_',' ') }}</strong><br><span class="muted">{{ event.detail }}</span></div><small>{{ event.event_at }}</small></div>{% else %}<p>No activity yet.</p>{% endfor %}</div>
+{% endblock %}
