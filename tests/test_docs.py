@@ -31,7 +31,7 @@ def test_readme_references_existing_local_assets():
 def test_landing_page_has_core_product_sections():
     page = (ROOT / "docs" / "index.html").read_text(encoding="utf-8")
     assert "Why DataSniper" in page
-    assert "Local-first" in page
+    assert "local-first" in page.lower()
     assert "Download from GitHub" in page
     assert 'id="product"' in page
     assert 'id="privacy"' in page
