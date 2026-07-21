@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{% block title %}DataSniper Privacy Agent{% endblock %}</title>
+  <style>
+    :root{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;color:#14213d;background:#f5f7fb;font-size:18px}
+    *{box-sizing:border-box} body{margin:0} header{background:#14213d;color:white;padding:20px 28px;display:flex;justify-content:space-between;align-items:center;gap:20px;flex-wrap:wrap} header a{color:white;text-decoration:none;font-weight:700} main{max-width:980px;margin:0 auto;padding:28px 20px 70px}.card{background:white;border-radius:18px;padding:24px;margin:0 0 20px;box-shadow:0 8px 24px rgba(20,33,61,.08)}h1,h2{line-height:1.15}h1{font-size:2rem;margin-top:0}.button,button{display:inline-block;border:0;border-radius:12px;background:#1769e0;color:white;padding:14px 20px;font-weight:750;font-size:1rem;text-decoration:none;cursor:pointer}.button.secondary,button.secondary{background:#e9eef7;color:#14213d}.button.success,button.success{background:#16794b}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:16px}.metric{font-size:2rem;font-weight:800}.muted{color:#5f6b7a}.status{display:inline-block;padding:6px 10px;border-radius:999px;background:#edf2fa;font-weight:700}.status.removed,.status.not_found{background:#def5e9;color:#12633d}.status.verification_due{background:#fff1cc;color:#7a4d00}.status.failed{background:#ffe0e0;color:#8d2020}label{display:block;font-weight:750;margin:18px 0 7px}input,select,textarea{width:100%;padding:14px;border:2px solid #ced7e5;border-radius:12px;font:inherit}textarea{min-height:110px}.task-row{display:flex;justify-content:space-between;gap:20px;align-items:center;padding:18px 0;border-top:1px solid #e5eaf2}.task-row:first-child{border-top:0}.task-row .details{min-width:0}.notice{background:#fff7d6;border-left:6px solid #e5a900;padding:16px;border-radius:10px}.good{background:#e4f7ed;border-left:6px solid #16794b;padding:16px;border-radius:10px}@media(max-width:640px){:root{font-size:19px}.task-row{display:block}.task-row .button{margin-top:12px;width:100%;text-align:center}}
+  </style>
+</head>
+<body>
+<header>
+  <a href="/">DataSniper Privacy Agent</a>
+  <nav><a href="/audit">Activity history</a></nav>
+</header>
+<main>{% block content %}{% endblock %}</main>
+</body>
+</html>
