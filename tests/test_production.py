@@ -1,19 +1,24 @@
 import json
-import sqlite3
 import zipfile
 
 
 def configure(tmp_path, monkeypatch):
     monkeypatch.setenv("DATASNIPER_SESSION_SECRET", "test-secret-that-is-long-enough-for-tests")
     monkeypatch.setenv("DATASNIPER_AUTOBACKUP", "0")
+
+    import app as base
     import production as p
 
+    base.DATA_DIR = tmp_path
+    base.DB_PATH = tmp_path / "privacy_agent.db"
+    base.KEY_PATH = tmp_path / ".vault.key"
     p.DATA_DIR = tmp_path
-    p.DB_PATH = tmp_path / "privacy_agent.db"
-    p.KEY_PATH = tmp_path / ".vault.key"
+    p.DB_PATH = base.DB_PATH
+    p.KEY_PATH = base.KEY_PATH
     p.ADMIN_FILE = tmp_path / ".admin.json"
     p.BACKUP_DIR = tmp_path / "backups"
     p.BACKUP_DIR.mkdir(exist_ok=True)
+    base.init_db()
     return p
 
 
@@ -28,11 +33,6 @@ def test_admin_password_is_hashed(tmp_path, monkeypatch):
 
 def test_consistent_backup_contains_recovery_material(tmp_path, monkeypatch):
     p = configure(tmp_path, monkeypatch)
-    connection = sqlite3.connect(p.DB_PATH)
-    connection.execute("CREATE TABLE sample(value TEXT)")
-    connection.execute("INSERT INTO sample VALUES('ok')")
-    connection.commit()
-    connection.close()
     p.KEY_PATH.write_text("local-recovery-key", encoding="utf-8")
     p.save_admin("family", "correct horse battery")
 
