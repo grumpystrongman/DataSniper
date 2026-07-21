@@ -1,81 +1,259 @@
-# DataSniper Privacy Agent
+<p align="center">
+  <img src="docs/assets/logo.svg" width="680" alt="DataSniper Privacy Agent">
+</p>
 
-A local-first privacy assistant that helps a household find high-priority data-broker removal paths, complete requests, track deadlines, and verify whether information was removed or resurfaced.
+<p align="center"><strong>Take back your personal data—without another subscription.</strong></p>
 
-## Current release target
+<p align="center">
+  DataSniper is a local-first privacy agent that prepares data-broker removal work, guides safe submission, tracks deadlines, and tells your family only when human attention is actually needed.
+</p>
 
-This branch is a **production-oriented household beta**. It is suitable for controlled use by the repository owner and trusted family members on a private computer or home network. It is not yet approved for hosting unrelated customers or exposure to the public internet.
+<p align="center">
+  <a href="../../actions/workflows/ci.yml"><img alt="CI" src="https://github.com/grumpystrongman/DataSniper/actions/workflows/ci.yml/badge.svg"></a>
+  <img alt="Python 3.11 and 3.12" src="https://img.shields.io/badge/Python-3.11%20%7C%203.12-3776AB?logo=python&logoColor=white">
+  <img alt="Local first" src="https://img.shields.io/badge/privacy-local--first-0f766e">
+  <img alt="Docker" src="https://img.shields.io/badge/Docker-supported-2496ED?logo=docker&logoColor=white">
+  <img alt="Household beta" src="https://img.shields.io/badge/release-household%20beta-f59e0b">
+</p>
 
-## Design principles
+<p align="center">
+  <a href="#get-started">Get started</a> ·
+  <a href="#see-datasniper-in-action">See the product</a> ·
+  <a href="#why-use-datasniper">Why DataSniper</a> ·
+  <a href="#frequently-asked-questions">FAQ</a> ·
+  <a href="SECURITY.md">Security</a>
+</p>
 
-- **Simple by default:** one guided setup and one clear next action.
-- **Local first:** identity information is encrypted and stored on the household’s computer.
-- **Hands-off monitoring:** deadlines, follow-ups, verification dates, and weekly backups are handled automatically.
-- **Human approval for sensitive actions:** the agent does not submit forms, upload identity documents, accept attestations, or file complaints without the person’s involvement.
-- **Accessible:** large controls, plain language, family-helper support, and no technical workflow terminology in the primary interface.
-- **Safe failure:** a broken broker workflow stops and explains what the person should do rather than guessing or submitting uncertain information.
+![DataSniper product hero](docs/assets/hero.svg)
 
-## Recommended household installation
+## The privacy problem is not one form
 
-Python 3.11 or newer is required for the developer installation:
+Removing personal information from the internet is repetitive, confusing, and easy to abandon. Every company has a different page, a different verification method, and a different response window. Even after a listing disappears, it may return months later.
+
+DataSniper turns that bureaucracy into a household workflow:
+
+1. Complete one plain-language setup.
+2. Receive one prioritized privacy task at a time.
+3. Let the browser companion fill recognized fields.
+4. Approve sensitive actions yourself.
+5. Let DataSniper track deadlines, rechecks, and resurfacing.
+
+> **You make the decisions. DataSniper handles the administrative work.**
+
+## Why use DataSniper?
+
+### Stop maintaining a privacy spreadsheet
+
+DataSniper records what was prepared, submitted, confirmed, removed, denied, or scheduled for another check. You no longer need to remember which company promised what—or when to look again.
+
+### Protect a household, not just one browser
+
+The interface is designed for spouses, caregivers, and trusted family helpers. Large controls, plain language, and one clear next action make privacy work approachable for people who do not live in technology.
+
+### Keep identity data out of another company’s cloud
+
+The identity vault and workflow database remain on your computer or private home server. DataSniper does not require an advertising profile, analytics account, or hosted identity repository.
+
+### Avoid another permanent subscription
+
+DataSniper is being built as software you control. The household beta does not require a monthly privacy-service subscription.
+
+### Preserve evidence
+
+Requests, dates, confirmations, outcomes, and audit events stay organized. Recovery archives include integrity checks so a household administrator can verify that a backup has not changed.
+
+## See DataSniper in action
+
+![Animated DataSniper workflow](docs/assets/demo.svg)
+
+### One calm dashboard
+
+![DataSniper dashboard preview](docs/assets/dashboard.svg)
+
+The primary screen answers three questions: **What needs me now? What is waiting? What has been completed?** Technical workflow states remain available without dominating the experience.
+
+### Setup written for ordinary people
+
+![DataSniper onboarding preview](docs/assets/onboarding.svg)
+
+DataSniper asks for the minimum information needed to prepare privacy work and explains why it is requested. Sensitive values are encrypted locally.
+
+> Screens shown above are product previews based on the current application workflow. Exact appearance may change as accessibility testing continues.
+
+## DataSniper compared
+
+| Capability | DataSniper | Doing it manually | Typical managed service |
+|---|:---:|:---:|:---:|
+| Local encrypted identity vault | ✅ | Usually not | Usually cloud-hosted |
+| One prioritized next action | ✅ | ❌ | Varies |
+| Deadline and recheck tracking | ✅ | Manual | ✅ |
+| Family-helper workflow | ✅ | Ad hoc | Varies |
+| Browser-assisted form filling | ✅ | ❌ | Hidden from user |
+| User controls legal attestations | ✅ | ✅ | Varies |
+| No recurring subscription required | ✅ | ✅ | Usually ❌ |
+| Transparent audit history | ✅ | Only if maintained | Varies |
+| Works on a private home server | ✅ | N/A | Usually ❌ |
+
+DataSniper is not a magic deletion button. It is a transparent, evidence-driven assistant that reduces the work while keeping consequential decisions with the person or their authorized helper.
+
+## Privacy architecture
+
+![DataSniper local-first architecture](docs/assets/architecture.svg)
+
+Core safeguards include:
+
+- Encrypted identity values at rest
+- Argon2 household-administrator passwords
+- Localhost-only default network exposure
+- Strict sessions, trusted-host checks, and origin protection
+- No-store browser responses and defensive security headers
+- Consistent SQLite recovery backups with SHA-256 checksums
+- Non-root, read-only Docker deployment with dropped capabilities
+- Human approval before submission, identification upload, attestations, appeals, or complaints
+
+Read the full [privacy statement](PRIVACY.md) and [security policy](SECURITY.md).
+
+## Get started
+
+### Recommended: Docker Desktop
+
+This keeps installation predictable and isolates the application from the rest of the computer.
 
 ```bash
+git clone https://github.com/grumpystrongman/DataSniper.git
+cd DataSniper
+cp .env.example .env
+docker compose up -d --build
+```
+
+Open `http://127.0.0.1:8787`, create the household administrator password, and follow the guided setup.
+
+### Python
+
+Python 3.11 or newer is supported.
+
+```bash
+git clone https://github.com/grumpystrongman/DataSniper.git
+cd DataSniper
 python -m venv .venv
-# Windows: .venv\Scripts\activate
-# macOS/Linux: source .venv/bin/activate
+```
+
+Windows:
+
+```powershell
+.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
 python run.py
 ```
 
-The first launch opens `http://127.0.0.1:8787`, asks for a household administrator password, and then starts guided identity setup.
-
-For a containerized home-server installation:
+macOS or Linux:
 
 ```bash
-cp .env.example .env
-# Replace DATASNIPER_SESSION_SECRET with a generated random value.
-docker compose up -d --build
+source .venv/bin/activate
+pip install -r requirements.txt
+python run.py
 ```
 
-The Compose configuration binds only to localhost, runs as a non-root user, drops Linux capabilities, uses a read-only application filesystem, and stores persistent household data under `./data`.
+### Browser companion
 
-## Production protections now included
+Until Chrome and Edge store releases are available:
 
-- Encrypted local identity fields and a local vault key
-- Argon2-protected household administrator account
-- Strict same-site sessions and optional Secure cookies
-- Foreign-origin rejection for state-changing browser requests
-- Login rate limiting
-- Security headers and no-store responses
-- Trusted-host restriction
-- Automatic six-hour deadline monitoring
-- Weekly consistent SQLite backups with SHA-256 checksums
-- Local activity audit history
-- Non-root, capability-free container deployment
-- Automated tests on Python 3.11 and 3.12
-- Dependency vulnerability auditing in GitHub Actions
-- Documented security and privacy boundaries
-
-## Browser companion
-
-1. Open Chrome or Edge extension management.
+1. Open the browser’s extension-management page.
 2. Enable developer mode.
-3. Choose **Load unpacked**.
-4. Select the `browser-extension` folder.
-5. Start DataSniper.
+3. Select **Load unpacked**.
+4. Choose the `browser-extension` folder.
+5. Start DataSniper. The companion pairs with the local service.
 
-The companion pairs with the local service. It can open the next privacy task and fill recognized fields, but it intentionally never submits forms, uploads identification, completes CAPTCHAs, or accepts legal attestations.
+The companion can open the current privacy task and fill recognized fields. It intentionally does **not** submit forms, bypass CAPTCHAs, upload identity documents, or accept legal language.
 
-## Household operations
+## What DataSniper handles today
 
-The `/admin` page creates recovery backups. Backups contain encrypted identity records **and the local decryption key**, so they must be stored on encrypted media controlled by the household. A working recovery process requires both the database and vault key.
+- Encrypted local identity storage
+- Plain-language household onboarding
+- State-aware starter protection plans
+- Grouped PeopleConnect coverage
+- California DROP guidance for California residents
+- People-search and prescreening privacy tasks
+- Request preparation and confirmation tracking
+- Expected-response and verification dates
+- Removed, no-record, waiting, failed, and resurfaced outcomes
+- Local audit history
+- Browser-assisted form filling
+- Automatic monitoring and weekly recovery backups
+- Household administrator authentication
+- Hardened Docker operation
 
-Do not expose DataSniper directly to the public internet. Remote household access should use a private VPN and HTTPS configured by someone qualified to administer the network.
+## Frequently asked questions
 
-## Safety boundary
+### Does DataSniper guarantee deletion?
 
-DataSniper assists with administrative privacy work. It does not bypass access controls, impersonate a person, establish legal authority for a helper, guarantee discovery of every broker, or claim that disappearance from a public page proves backend deletion.
+No. A company may suppress a public listing without deleting every backend record, may qualify for an exemption, or may require additional verification. DataSniper records the strongest outcome supported by evidence instead of overstating success.
 
-## Before selling to unrelated customers
+### Does DataSniper upload my personal information?
 
-A public commercial release still requires a signed embedded-runtime installer, signed automatic updates, browser-store publication, independent security review, product-counsel review, verified broker adapters, restore-tested migration tooling, granular delegated accounts, customer support and incident-response processes, accessibility testing with older adults, and completed product/trademark/insurance decisions. See [SECURITY.md](SECURITY.md) and [PRIVACY.md](PRIVACY.md).
+Not by default. The household product stores identity and workflow data locally. Opening a broker’s website necessarily sends information that you choose to enter or submit to that broker.
+
+### Can I use it for my spouse, parent, or child?
+
+Yes, when you have their permission or legal authority. DataSniper supports trusted-family assistance, but software cannot create authority that does not exist.
+
+### Is this an automatic bot?
+
+It automates preparation, sequencing, deadlines, reminders, and recognized form fields. It stops for CAPTCHA challenges, identity documents, attestations, final submissions, appeals, and complaints.
+
+### Why not expose it to the public internet?
+
+DataSniper contains sensitive household identity data. The supported household deployment is a private computer or home server bound to localhost. Remote access should use a carefully configured private network or VPN, not an open port.
+
+### Does it work outside the United States?
+
+The architecture can support other jurisdictions, but the current starter catalog and rights logic are focused on United States workflows.
+
+### Is it ready for paying customers?
+
+Not yet. It is a production-oriented **household beta** for the repository owner and trusted family. A public commercial release still requires signed installers and updates, browser-store review, independent security testing, counsel review, granular delegated accounts, broader verified adapters, formal accessibility testing, and support operations.
+
+## Roadmap
+
+- [x] Local encrypted privacy vault
+- [x] Guided household setup
+- [x] One-next-action dashboard
+- [x] Deadline and resurfacing tracking
+- [x] Browser companion
+- [x] Household authentication and backups
+- [x] Docker hardening and CI security audit
+- [ ] Signed Windows installer with embedded runtime
+- [ ] Signed automatic updates and rollback
+- [ ] Chrome and Edge store publication
+- [ ] Separate family-member and helper permissions
+- [ ] Verified adapter registry with change monitoring
+- [ ] Email-confirmation parsing
+- [ ] Formal accessibility study with older adults
+- [ ] Restore-tested schema migrations
+- [ ] Public support and incident-response program
+
+## Development and validation
+
+```bash
+pip install -r requirements.txt
+pytest -q
+python -m compileall -q app.py production.py run.py
+```
+
+GitHub Actions tests Python 3.11 and 3.12 and runs a blocking dependency vulnerability audit.
+
+## Responsible use
+
+DataSniper assists with lawful personal privacy administration. Do not use it to impersonate another person, bypass access controls, submit false statements, scrape prohibited systems, or interfere with services.
+
+## Project status and licensing
+
+DataSniper is currently a household beta. Source is published for evaluation and development, but a final public-use and commercial license has not yet been selected. Do not assume permission beyond applicable law and explicit repository notices.
+
+## Contributing
+
+Useful contributions include verified broker workflow updates, accessibility improvements, tests, documentation, and privacy-preserving deployment work. Open an issue before substantial changes so the implementation remains aligned with the local-first safety model.
+
+---
+
+<p align="center"><strong>Privacy protection should not require becoming a privacy expert.</strong></p>
