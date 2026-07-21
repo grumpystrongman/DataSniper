@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>Hello, {{ profile.full_name }}</h1>
+  <p class="muted">Your agent is tracking privacy work and will surface only the next thing that needs you.</p>
+  <div class="grid">
+    <div><div class="metric">{{ summary.total }}</div><div class="muted">protections tracked</div></div>
+    <div><div class="metric">{{ summary.waiting }}</div><div class="muted">waiting on companies</div></div>
+    <div><div class="metric">{{ summary.done }}</div><div class="muted">completed</div></div>
+    <div><div class="metric">{{ summary.attention }}</div><div class="muted">need a recheck</div></div>
+  </div>
+</div>
+{% if next_task %}
+<div class="card">
+  <h2>Your next step</h2>
+  <p><strong>{{ next_task.broker_name }}</strong></p>
+  <p class="muted">{{ next_task.notes }}</p>
+  {% if next_task.status == 'verification_due' %}<p class="notice">The company’s expected removal window has passed. Recheck the listing and record what you find.</p>{% endif %}
+  <a class="button" href="/task/{{ next_task.id }}">Continue protection</a>
+</div>
+{% else %}
+<div class="card good"><h2>You are caught up</h2><p>The agent will continue tracking waiting periods and future verification dates.</p></div>
+{% endif %}
+<div class="card">
+  <h2>All protection tasks</h2>
+  {% for item in requests %}
+  <div class="task-row">
+    <div class="details"><strong>{{ item.broker_name }}</strong><br><span class="muted">{{ item.notes }}</span><br><span class="status {{ item.status }}">{{ item.status.replace('_',' ') }}</span></div>
+    <a class="button secondary" href="/task/{{ item.id }}">View</a>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}
