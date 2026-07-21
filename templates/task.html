@@ -5,6 +5,7 @@
   <h1>{{ task.broker_name }}</h1>
   <p>{{ task.notes }}</p>
   <p><span class="status {{ task.status }}">{{ task.status.replace('_',' ') }}</span></p>
+  {% if identity_variants %}<details><summary><strong>Identity variants to check ({{ identity_variants|length }})</strong></summary><ul>{% for item in identity_variants %}<li>{{ item.kind.replace('_',' ')|title }}: {{ item.value }}{% if item.label %} — {{ item.label }}{% endif %}</li>{% endfor %}</ul></details>{% endif %}
   {% if task.status == 'prepared' %}
     <div class="notice"><strong>The agent has prepared this task.</strong> Review the broker page, complete any CAPTCHA or identity check, and submit only when you are comfortable.</div>
     <p><a class="button" href="{{ task.url }}" target="_blank" rel="noopener">Open the official removal page</a></p>
@@ -27,5 +28,23 @@
     <p><a class="button secondary" href="{{ task.url }}" target="_blank" rel="noopener">Check it again</a></p>
     <form method="post" action="/task/{{ task.id }}/result"><input type="hidden" name="outcome" value="verification_due"><label>Reason for reopening</label><textarea name="notes"></textarea><button type="submit">Reopen this task</button></form>
   {% endif %}
+</div>
+<div class="card">
+  <h2>Confirmation and resurfacing</h2>
+  <p class="muted">Record the public result URL, if this broker provides one. DataSniper checks saved URLs daily; it does not send your identity during the check.</p>
+  <form method="post" action="/task/{{ task.id }}/tracking">
+    <label>Public profile URL, optional</label><input type="url" name="public_profile_url" value="{{ task.public_profile_url or '' }}" placeholder="https://broker.example/profile/...">
+    <label>Email/request status</label><select name="confirmation_status">
+      {% for value,label in [('not_expected','No email expected'),('awaiting_email','Awaiting verification email'),('action_required','Email action required'),('confirmed','Request confirmed'),('completed','Broker says completed'),('denied','Request denied')] %}<option value="{{ value }}" {% if task.confirmation_status == value %}selected{% endif %}>{{ label }}</option>{% endfor %}
+    </select>
+    {% if task.profile_checked_at %}<p><strong>Last public-profile check:</strong> {{ task.profile_check_status or 'inconclusive' }} at {{ task.profile_checked_at }}</p>{% endif %}
+    <button type="submit">Save tracking</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Encrypted evidence</h2>
+  <p class="muted">Store confirmations, screenshots, PDFs, or broker responses with this request. Files are encrypted on disk (10 MB maximum each).</p>
+  {% for item in evidence %}<div class="task-row"><div><a href="/evidence/{{ item.id }}"><strong>{{ item.filename }}</strong></a> · {{ (item.size / 1024)|round(1) }} KB{% if item.note %}<br><span class="muted">{{ item.note }}</span>{% endif %}</div><form method="post" action="/evidence/{{ item.id }}/delete"><button class="secondary" type="submit">Delete</button></form></div>{% endfor %}
+  <form method="post" action="/task/{{ task.id }}/evidence" enctype="multipart/form-data"><label>File</label><input type="file" name="upload" required><label>Private note, optional</label><input name="note"><button type="submit">Encrypt and save evidence</button></form>
 </div>
 {% endblock %}

@@ -15,6 +15,8 @@ def configure(tmp_path, monkeypatch):
     p.DATA_DIR = tmp_path
     p.DB_PATH = base.DB_PATH
     p.KEY_PATH = base.KEY_PATH
+    base.EVIDENCE_DIR = tmp_path / "evidence"
+    p.EVIDENCE_DIR = base.EVIDENCE_DIR
     p.ADMIN_FILE = tmp_path / ".admin.json"
     p.BACKUP_DIR = tmp_path / "backups"
     p.BACKUP_DIR.mkdir(exist_ok=True)
@@ -35,12 +37,14 @@ def test_consistent_backup_contains_recovery_material(tmp_path, monkeypatch):
     p = configure(tmp_path, monkeypatch)
     p.KEY_PATH.write_text("local-recovery-key", encoding="utf-8")
     p.save_admin("family", "correct horse battery")
+    p.EVIDENCE_DIR.mkdir()
+    (p.EVIDENCE_DIR / "proof.vault").write_bytes(b"encrypted-evidence")
 
     target = p.create_backup()
     assert target.exists()
     assert target.with_suffix(".zip.sha256").exists()
     with zipfile.ZipFile(target) as archive:
-        assert {"privacy_agent.db", ".vault.key", ".admin.json", "manifest.json"}.issubset(archive.namelist())
+        assert {"privacy_agent.db", ".vault.key", ".admin.json", "manifest.json", "evidence/proof.vault"}.issubset(archive.namelist())
 
 
 def test_origin_policy():

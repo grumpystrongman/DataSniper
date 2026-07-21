@@ -15,6 +15,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlsplit
 
+import httpx
+
 from fastapi import Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from passlib.context import CryptContext
@@ -22,7 +24,11 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from app import DATA_DIR, DB_PATH, KEY_PATH, app, audit, refresh_due_statuses
+from app import (
+    DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, refresh_due_statuses,
+    setting, sync_catalog_plan, utcnow,
+)
+from broker_catalog import BROKERS, CATALOG_VERSION
 
 ROOT = Path(__file__).resolve().parent
 ADMIN_FILE = DATA_DIR / ".admin.json"
@@ -95,8 +101,9 @@ def same_origin(request: Request) -> bool:
         request.headers.get("host", ""),
         *request.headers.get("x-forwarded-host", "").split(","),
     }
+    request_url = getattr(request, "url", None)
     protocols = {
-        request.url.scheme,
+        getattr(request_url, "scheme", "http"),
         *request.headers.get("x-forwarded-proto", "").split(","),
     }
     for host in hosts:
@@ -233,12 +240,136 @@ def create_backup() -> Path:
             archive.write(KEY_PATH, ".vault.key")
         if ADMIN_FILE.exists():
             archive.write(ADMIN_FILE, ".admin.json")
-        manifest = {"created_at": now_iso(), "format": 1, "encrypted_fields": True}
+        if EVIDENCE_DIR.exists():
+            for evidence_file in EVIDENCE_DIR.glob("*.vault"):
+                archive.write(evidence_file, f"evidence/{evidence_file.name}")
+        manifest = {"created_at": now_iso(), "format": 2, "encrypted_fields": True, "encrypted_evidence": True}
         archive.writestr("manifest.json", json.dumps(manifest, indent=2))
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     target.with_suffix(".zip.sha256").write_text(digest + "  " + target.name + "\n", encoding="utf-8")
     audit("backup_created", target.name)
     return target
+
+
+def catalog_audit_due() -> bool:
+    last_run = setting("catalog_audit_last_run")
+    if not last_run:
+        return True
+    try:
+        last = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - last).total_seconds() >= 86400
+
+
+def audit_broker_catalog(client: httpx.Client | None = None) -> dict[str, int]:
+    """Check official removal links without transmitting household identity data."""
+    own_client = client is None
+    client = client or httpx.Client(
+        follow_redirects=True,
+        timeout=httpx.Timeout(12.0),
+        headers={"User-Agent": "DataSniper-Catalog-Audit/1.0"},
+    )
+    counts = {"healthy": 0, "changed": 0, "unavailable": 0}
+    try:
+        for broker in BROKERS:
+            checked_at = utcnow()
+            status, http_status = "unavailable", None
+            final_url, content_hash, detail = broker["url"], "", ""
+            try:
+                response = client.get(broker["url"])
+                http_status = response.status_code
+                final_url = str(response.url)
+                body = response.text[:1_000_000]
+                content_hash = hashlib.sha256(body.encode("utf-8", errors="replace")).hexdigest()
+                status = "healthy" if response.status_code < 400 else "unavailable"
+                detail = "Official removal path reachable" if status == "healthy" else f"HTTP {response.status_code}"
+            except httpx.HTTPError as exc:
+                detail = type(exc).__name__
+
+            with db() as conn:
+                previous = conn.execute(
+                    "SELECT content_hash FROM broker_catalog_audits WHERE broker_slug=? ORDER BY id DESC LIMIT 1",
+                    (broker["slug"],),
+                ).fetchone()
+                if status == "healthy" and previous and previous["content_hash"] and previous["content_hash"] != content_hash:
+                    status = "changed"
+                    detail = "Page content changed; removal workflow needs human review"
+                conn.execute(
+                    """INSERT INTO broker_catalog_audits
+                    (broker_slug,checked_at,status,http_status,final_url,content_hash,detail)
+                    VALUES(?,?,?,?,?,?,?)""",
+                    (broker["slug"], checked_at, status, http_status, final_url, content_hash, detail),
+                )
+            counts[status] += 1
+
+        added = sync_catalog_plan()
+        with db() as conn:
+            for name, value in (("catalog_audit_last_run", utcnow()), ("catalog_version", CATALOG_VERSION)):
+                conn.execute(
+                    "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (name, value),
+                )
+        audit("catalog_audited", f"{counts['healthy']} healthy, {counts['changed']} changed, {counts['unavailable']} unavailable; {added} tasks added")
+        return counts
+    finally:
+        if own_client:
+            client.close()
+
+
+def check_saved_profiles(client: httpx.Client | None = None) -> dict[str, int]:
+    """Recheck user-saved public listing URLs without submitting identity data."""
+    own_client = client is None
+    client = client or httpx.Client(
+        follow_redirects=False,
+        timeout=httpx.Timeout(12.0),
+        headers={"User-Agent": "DataSniper-Resurfacing-Check/1.0"},
+    )
+    counts = {"absent": 0, "present": 0, "inconclusive": 0}
+    try:
+        with db() as conn:
+            rows = conn.execute(
+                """SELECT id,broker_name,status,public_profile_url,profile_check_status
+                FROM requests WHERE public_profile_url IS NOT NULL AND public_profile_url != ''"""
+            ).fetchall()
+        for row in rows:
+            check_status = "inconclusive"
+            try:
+                response = client.get(row["public_profile_url"])
+                body = response.text[:250_000].lower()
+                if response.status_code in {404, 410} or any(
+                    marker in body for marker in ("record has been removed", "page not found", "no longer available")
+                ):
+                    check_status = "absent"
+                elif response.status_code == 200 and len(body) >= 500 and not any(
+                    marker in body for marker in ("captcha", "access denied", "verify you are human")
+                ):
+                    check_status = "present"
+            except httpx.HTTPError:
+                pass
+
+            with db() as conn:
+                new_status = row["status"]
+                if check_status == "present" and row["status"] in {"removed", "not_found"}:
+                    new_status = "verification_due"
+                conn.execute(
+                    """UPDATE requests SET profile_check_status=?,profile_checked_at=?,status=?
+                    WHERE id=?""",
+                    (check_status, utcnow(), new_status, row["id"]),
+                )
+            if new_status != row["status"]:
+                audit("profile_resurfaced", f"{row['broker_name']} public listing may have reappeared")
+            counts[check_status] += 1
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO settings(key,value) VALUES('profile_audit_last_run',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""",
+                (utcnow(),),
+            )
+        return counts
+    finally:
+        if own_client:
+            client.close()
 
 
 @app.post("/admin/backup")
@@ -266,6 +397,9 @@ def monitor_loop() -> None:
     while True:
         try:
             refresh_due_statuses()
+            if os.environ.get("DATASNIPER_CATALOG_AUDIT", "1") == "1" and catalog_audit_due():
+                audit_broker_catalog()
+                check_saved_profiles()
             if os.environ.get("DATASNIPER_AUTOBACKUP", "1") == "1":
                 newest = max(BACKUP_DIR.glob("*.zip"), key=lambda p: p.stat().st_mtime, default=None)
                 if newest is None or time.time() - newest.stat().st_mtime > 7 * 86400:
