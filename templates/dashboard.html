@@ -22,6 +22,19 @@
 <div class="card good"><h2>You are caught up</h2><p>The agent will continue tracking waiting periods and future verification dates.</p></div>
 {% endif %}
 <div class="card">
+  <h2>Identity variants</h2>
+  <p class="muted">Former names, addresses, email addresses, phone numbers, and associated relatives help you recognize broker records. Values are encrypted locally.</p>
+  {% for item in identity_variants %}
+  <div class="task-row"><div><strong>{{ item.kind.replace('_',' ')|title }}:</strong> {{ item.value }}{% if item.label %}<br><span class="muted">{{ item.label }}</span>{% endif %}</div><form method="post" action="/identity-variants/{{ item.id }}/delete"><button class="secondary" type="submit">Delete</button></form></div>
+  {% endfor %}
+  <form method="post" action="/identity-variants">
+    <label>Type</label><select name="kind"><option value="name">Former or alternate name</option><option value="address">Previous address</option><option value="email">Old email</option><option value="phone">Old phone</option><option value="relative">Associated relative</option></select>
+    <label>Value</label><input name="value" required autocomplete="off">
+    <label>Private note, optional</label><input name="label" autocomplete="off">
+    <button type="submit">Add encrypted variant</button>
+  </form>
+</div>
+<div class="card">
   <h2>All protection tasks</h2>
   {% for item in requests %}
   <div class="task-row">

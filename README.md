@@ -180,6 +180,12 @@ The companion can open the current privacy task and fill recognized fields. It i
 - Local audit history
 - Browser-assisted form filling
 - Automatic monitoring and weekly recovery backups
+- Daily health audit of free, official broker-removal links
+- Automatic plan sync when a newly reviewed catalog entry becomes available
+- Encrypted identity variants for former names and contact details
+- Encrypted, request-specific evidence attachments
+- Daily resurfacing checks for user-saved public profile URLs
+- Structured verification-email and broker-response status tracking
 - Household administrator authentication
 - Hardened Docker operation
 
@@ -226,8 +232,11 @@ Not yet. It is a production-oriented **household beta** for the repository owner
 - [ ] Signed automatic updates and rollback
 - [ ] Chrome and Edge store publication
 - [ ] Separate family-member and helper permissions
-- [ ] Verified adapter registry with change monitoring
-- [ ] Email-confirmation parsing
+- [x] Verified removal-link catalog with daily change monitoring
+- [x] Identity variants, encrypted evidence, and resurfacing monitoring
+- [ ] Maintainer-reviewed registry import for discovering new broker candidates
+- [x] Manual confirmation-email status tracking
+- [ ] Optional local mailbox confirmation-email parsing
 - [ ] Formal accessibility study with older adults
 - [ ] Restore-tested schema migrations
 - [ ] Public support and incident-response program
