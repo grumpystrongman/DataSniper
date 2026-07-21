@@ -1,0 +1,31 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p><a href="/">← Back</a></p>
+  <h1>{{ task.broker_name }}</h1>
+  <p>{{ task.notes }}</p>
+  <p><span class="status {{ task.status }}">{{ task.status.replace('_',' ') }}</span></p>
+  {% if task.status == 'prepared' %}
+    <div class="notice"><strong>The agent has prepared this task.</strong> Review the broker page, complete any CAPTCHA or identity check, and submit only when you are comfortable.</div>
+    <p><a class="button" href="{{ task.url }}" target="_blank" rel="noopener">Open the official removal page</a></p>
+    <form method="post" action="/task/{{ task.id }}/submitted">
+      <label>Confirmation number or note, optional</label><input name="confirmation">
+      <button type="submit" class="success">I submitted the request</button>
+    </form>
+  {% elif task.status in ['waiting','verification_due'] %}
+    <p><strong>Expected completion:</strong> {{ task.due_at or 'Not recorded' }}</p>
+    <p><strong>Scheduled recheck:</strong> {{ task.verify_at or 'Not recorded' }}</p>
+    <p><a class="button" href="{{ task.url }}" target="_blank" rel="noopener">Recheck the broker</a></p>
+    <form method="post" action="/task/{{ task.id }}/result">
+      <label>What happened?</label>
+      <select name="outcome"><option value="removed">My information is gone</option><option value="not_found">No matching record was found</option><option value="waiting">The company says it is still processing</option><option value="failed">The request failed or was denied</option></select>
+      <label>Notes, optional</label><textarea name="notes"></textarea>
+      <button type="submit">Save result</button>
+    </form>
+  {% else %}
+    <div class="good"><strong>This task is recorded as {{ task.status.replace('_',' ') }}.</strong></div>
+    <p><a class="button secondary" href="{{ task.url }}" target="_blank" rel="noopener">Check it again</a></p>
+    <form method="post" action="/task/{{ task.id }}/result"><input type="hidden" name="outcome" value="verification_due"><label>Reason for reopening</label><textarea name="notes"></textarea><button type="submit">Reopen this task</button></form>
+  {% endif %}
+</div>
+{% endblock %}

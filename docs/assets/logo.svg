@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 220" role="img" aria-labelledby="title desc">
+<title id="title">DataSniper Privacy Agent</title><desc id="desc">A shield containing a privacy target beside the DataSniper wordmark.</desc>
+<defs><linearGradient id="g" x1="0" x2="1"><stop stop-color="#2563eb"/><stop offset="1" stop-color="#0f766e"/></linearGradient></defs>
+<rect width="900" height="220" rx="34" fill="#07111f"/>
+<path d="M108 34 178 59v52c0 44-27 75-70 91-43-16-70-47-70-91V59z" fill="url(#g)"/>
+<circle cx="108" cy="105" r="34" fill="none" stroke="#fff" stroke-width="9"/><circle cx="108" cy="105" r="9" fill="#fff"/><path d="M108 59v18M108 133v18M62 105h18M136 105h18" stroke="#fff" stroke-width="8" stroke-linecap="round"/>
+<text x="220" y="103" fill="#f8fafc" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="66" font-weight="750">DataSniper</text>
+<text x="224" y="151" fill="#94a3b8" font-family="Inter,Segoe UI,Arial,sans-serif" font-size="27" letter-spacing="4">PRIVACY AGENT</text>
+</svg>

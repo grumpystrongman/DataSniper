@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block title %}Set up your protection{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>Let’s protect your personal information</h1>
+  <p class="muted">This information stays on this computer in an encrypted local vault. It is used only to help complete privacy requests.</p>
+  <form method="post">
+    <label>Your full name</label><input name="full_name" autocomplete="name" required>
+    <label>Email used for privacy requests</label><input type="email" name="email" autocomplete="email" required>
+    <div class="grid"><div><label>State</label><input name="state" maxlength="2" placeholder="NC" required></div><div><label>Phone</label><input name="phone" autocomplete="tel"></div></div>
+    <label>Current street address</label><input name="address" autocomplete="street-address">
+    <div class="grid"><div><label>City</label><input name="city" autocomplete="address-level2"></div><div><label>ZIP code</label><input name="postal_code" autocomplete="postal-code"></div></div>
+    <div class="grid"><div><label>Birth year</label><input name="birth_year" inputmode="numeric" maxlength="4"></div><div><label>Trusted helper’s name, optional</label><input name="helper_name"></div></div>
+    <p class="notice">The agent will prepare the work automatically. It will stop before sending a request, uploading identification, or making a legal statement.</p>
+    <button type="submit">Start protecting me</button>
+  </form>
+</div>
+{% endblock %}
