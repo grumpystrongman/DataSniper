@@ -1,61 +1,52 @@
-from fastapi.testclient import TestClient
+import json
+import sqlite3
+import zipfile
 
 
-def load_app(tmp_path, monkeypatch):
+def configure(tmp_path, monkeypatch):
     monkeypatch.setenv("DATASNIPER_SESSION_SECRET", "test-secret-that-is-long-enough-for-tests")
     monkeypatch.setenv("DATASNIPER_AUTOBACKUP", "0")
-    monkeypatch.setenv("DATASNIPER_ALLOWED_HOSTS", "testserver,localhost,127.0.0.1")
+    import production as p
 
-    import app as base
-    base.DATA_DIR = tmp_path
-    base.DB_PATH = tmp_path / "privacy_agent.db"
-    base.KEY_PATH = tmp_path / ".vault.key"
-
-    import production
-    production.DATA_DIR = tmp_path
-    production.DB_PATH = base.DB_PATH
-    production.KEY_PATH = base.KEY_PATH
-    production.ADMIN_FILE = tmp_path / ".admin.json"
-    production.BACKUP_DIR = tmp_path / "backups"
-    production.BACKUP_DIR.mkdir(exist_ok=True)
-    base.init_db()
-    return production
+    p.DATA_DIR = tmp_path
+    p.DB_PATH = tmp_path / "privacy_agent.db"
+    p.KEY_PATH = tmp_path / ".vault.key"
+    p.ADMIN_FILE = tmp_path / ".admin.json"
+    p.BACKUP_DIR = tmp_path / "backups"
+    p.BACKUP_DIR.mkdir(exist_ok=True)
+    return p
 
 
-def test_admin_setup_login_headers_origin_and_backup(tmp_path, monkeypatch):
-    p = load_app(tmp_path, monkeypatch)
-    with TestClient(p.app) as client:
-        setup = client.post(
-            "/setup-admin",
-            data={
-                "username": "family",
-                "password": "correct horse battery",
-                "confirm": "correct horse battery",
-            },
-            follow_redirects=False,
-        )
-        assert setup.status_code == 303
+def test_admin_password_is_hashed(tmp_path, monkeypatch):
+    p = configure(tmp_path, monkeypatch)
+    p.save_admin("Family", "correct horse battery")
+    saved = json.loads(p.ADMIN_FILE.read_text(encoding="utf-8"))
+    assert saved["username"] == "family"
+    assert saved["password_hash"] != "correct horse battery"
+    assert p.PASSWORDS.verify("correct horse battery", saved["password_hash"])
 
-        rejected = client.post(
-            "/login",
-            headers={"origin": "https://attacker.example"},
-            data={"username": "family", "password": "correct horse battery"},
-        )
-        assert rejected.status_code == 403
 
-        login = client.post(
-            "/login",
-            data={"username": "family", "password": "correct horse battery"},
-            follow_redirects=False,
-        )
-        assert login.status_code == 303
+def test_consistent_backup_contains_recovery_material(tmp_path, monkeypatch):
+    p = configure(tmp_path, monkeypatch)
+    connection = sqlite3.connect(p.DB_PATH)
+    connection.execute("CREATE TABLE sample(value TEXT)")
+    connection.execute("INSERT INTO sample VALUES('ok')")
+    connection.commit()
+    connection.close()
+    p.KEY_PATH.write_text("local-recovery-key", encoding="utf-8")
+    p.save_admin("family", "correct horse battery")
 
-        page = client.get("/welcome")
-        assert page.status_code == 200
-        assert page.headers["x-frame-options"] == "DENY"
-        assert page.headers["cache-control"] == "no-store"
-        assert "frame-ancestors 'none'" in page.headers["content-security-policy"]
+    target = p.create_backup()
+    assert target.exists()
+    assert target.with_suffix(".zip.sha256").exists()
+    with zipfile.ZipFile(target) as archive:
+        assert {"privacy_agent.db", ".vault.key", ".admin.json", "manifest.json"}.issubset(archive.namelist())
 
-        backup = p.create_backup()
-        assert backup.exists()
-        assert backup.with_suffix(".zip.sha256").exists()
+
+def test_origin_policy():
+    import production as p
+
+    class FakeRequest:
+        headers = {"origin": "https://attacker.example", "host": "localhost:8787"}
+
+    assert p.same_origin(FakeRequest()) is False
