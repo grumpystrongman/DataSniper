@@ -66,6 +66,10 @@ class QueueStore:
 
     def worker_status(self, state: str, detail: str = "") -> None:
         with self.db_factory() as conn:
+            previous = conn.execute(
+                "SELECT value FROM settings WHERE key='browser_worker_state'"
+            ).fetchone()
+            transition_at = _now() if not previous or previous["value"] != state else None
             for key, value in (
                 ("browser_worker_state", state), ("browser_worker_heartbeat", _now()),
                 ("browser_worker_detail", detail[:500]), ("browser_worker_id", self.worker_id),
@@ -73,6 +77,11 @@ class QueueStore:
                 conn.execute(
                     "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, value),
+                )
+            if transition_at:
+                conn.execute(
+                    "INSERT INTO settings(key,value) VALUES('browser_worker_transition_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    (transition_at,),
                 )
 
     def claim(self) -> dict[str, Any] | None:
@@ -259,6 +268,11 @@ class BrowserWorker:
         self.record_fn, self.evidence_fn, self.audit_fn = record_fn, evidence_fn, audit_fn
         self.executor = executor or PlaywrightExecutor()
         self.stop_event = threading.Event()
+        self.wake_event = threading.Event()
+
+    def wake(self) -> None:
+        """Interrupt the idle poll wait when an operator schedules work."""
+        self.wake_event.set()
 
     def run_once(self) -> bool:
         job = self.store.claim()
@@ -286,15 +300,23 @@ class BrowserWorker:
 
     def run_forever(self) -> None:
         recovered = self.store.recover_stale()
-        self.store.worker_status("online", f"Recovered {recovered} interrupted job(s)")
-        self.audit_fn("browser_worker_started", f"Browser worker online; {recovered} interrupted job(s) recovered")
+        self.store.worker_status("launching_browser", "Starting Chromium and its isolated DataSniper profile")
         try:
+            self.executor.start()
+            self.store.worker_status("online", f"Chromium ready; recovered {recovered} interrupted job(s)")
+            self.audit_fn("browser_worker_started", f"Browser worker and Chromium online; {recovered} interrupted job(s) recovered")
             while not self.stop_event.is_set():
                 self.store.worker_status("online")
                 if not self.run_once():
-                    self.stop_event.wait(float(os.environ.get("DATASNIPER_BROWSER_POLL_SECONDS", "5")))
+                    self.wake_event.wait(float(os.environ.get("DATASNIPER_BROWSER_POLL_SECONDS", "5")))
+                    self.wake_event.clear()
+        except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:450]}"
+            self.store.worker_status("failed", detail)
+            self.audit_fn("browser_worker_failed", detail)
         finally:
-            self.store.worker_status("offline", "Worker stopped")
+            if self.stop_event.is_set():
+                self.store.worker_status("offline", "Worker stopped")
             self.executor.close()
 
 
@@ -327,11 +349,20 @@ class WorkerSupervisor:
                     return {"state": "restarting", "detail": "Worker will start after the previous instance stops"}
                 return {"state": "online", "detail": "Browser worker is already running"}
             self._worker = self.worker_factory()
+            self._worker.store.worker_status("starting", "Creating the background worker")
             self._thread = threading.Thread(
                 target=self._worker.run_forever, daemon=True, name="datasniper-browser-worker"
             )
             self._thread.start()
             return {"state": "starting", "detail": "Browser worker is starting"}
+
+    def wake(self) -> dict[str, str]:
+        """Start an offline worker or immediately notify the live worker of queued work."""
+        with self._lock:
+            if not self._alive() or not self._worker:
+                return self.start()
+            self._worker.wake()
+            return {"state": "waking", "detail": "Worker notified that new work is ready"}
 
     def stop(self) -> dict[str, str]:
         with self._lock:

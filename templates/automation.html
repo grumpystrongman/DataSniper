@@ -9,6 +9,9 @@
     {{ request.query_params.get('control_state').replace('_',' ') }}{% if request.query_params.get('control_detail') %} — {{ request.query_params.get('control_detail') }}{% endif %}
   </div>
   {% endif %}
+  {% if request.query_params.get('run_count') %}
+  <div class="notice" role="status" aria-live="polite"><strong>{{ request.query_params.get('run_count') }} selected item(s) scheduled.</strong> The worker was started or awakened; progress appears below.</div>
+  {% endif %}
   <div id="worker-health" data-state="{{ overview.worker.state }}" class="{{ 'good' if overview.worker.online else 'notice' }}" role="status" aria-live="polite">
   {% if overview.worker.online %}
   <strong>Background browser worker online.</strong> <span id="worker-summary">{{ overview.running }} running · {{ overview.queue }} queued</span>{% if overview.worker.heartbeat %} · heartbeat <span id="worker-heartbeat">{{ overview.worker.heartbeat }}</span>{% endif %}.
@@ -100,15 +103,17 @@
     <span class="muted">Reruns keep prior transaction history and create a new audited attempt.</span>
   </form>
 </div>
-<div class="card">
+<div class="card" id="live-execution">
   <h2>Live execution</h2>
+  <div id="live-jobs">
   {% for job in overview.activity %}
-  <div class="task-row">
+  <div class="task-row" data-job-id="{{ job.id }}">
     <div><strong>{{ job.broker_name }}</strong><br><span class="status {{ job.status }}">{{ job.status }}</span> · {{ (job.stage or 'scheduled').replace('_',' ') }}
       {% if job.last_error %}<br><span class="next-action">{{ job.last_error }}</span>{% endif %}</div>
     <small>queued {{ job.created_at }}{% if job.started_at %}<br>started {{ job.started_at }}{% endif %}{% if job.heartbeat_at %}<br>updated {{ job.heartbeat_at }}{% endif %}{% if job.finished_at %}<br>finished {{ job.finished_at }}{% endif %}</small>
   </div>
   {% else %}<p>No browser jobs have been scheduled.</p>{% endfor %}
+  </div>
 </div>
 <div class="card">
   <h2>Authorization policy</h2>
@@ -156,6 +161,22 @@
   const health=document.querySelector('#worker-health');
   const state=document.querySelector('#worker-state');
   const checked=document.querySelector('#worker-checked');
+  const liveJobs=document.querySelector('#live-jobs');
+  const escapeText=value=>String(value??'');
+  const renderJobs=jobs=>{
+    liveJobs.replaceChildren();
+    if(!jobs.length){const p=document.createElement('p');p.textContent='No browser jobs have been scheduled.';liveJobs.append(p);return;}
+    jobs.forEach(job=>{
+      const row=document.createElement('div');row.className='task-row';row.dataset.jobId=job.id;
+      const info=document.createElement('div');
+      const name=document.createElement('strong');name.textContent=escapeText(job.broker_name);
+      const status=document.createElement('span');status.className=`status ${escapeText(job.status)}`;status.textContent=escapeText(job.status);
+      info.append(name,document.createElement('br'),status,document.createTextNode(` · ${escapeText(job.stage||'scheduled').replaceAll('_',' ')}`));
+      if(job.last_error){const br=document.createElement('br');const reason=document.createElement('span');reason.className='next-action';reason.textContent=escapeText(job.last_error);info.append(br,reason);}
+      const times=document.createElement('small');times.textContent=`queued ${escapeText(job.created_at)}${job.started_at?` · started ${job.started_at}`:''}${job.heartbeat_at?` · updated ${job.heartbeat_at}`:''}${job.finished_at?` · finished ${job.finished_at}`:''}`;
+      row.append(info,times);liveJobs.append(row);
+    });
+  };
   const renderHealth=(title,detail,isOnline)=>{
     health.replaceChildren();
     const strong=document.createElement('strong');
@@ -174,9 +195,10 @@
       if(data.worker.online){
         renderHealth('Background browser worker online.',` ${data.running} running · ${data.queue} queued${data.worker.heartbeat?` · heartbeat ${data.worker.heartbeat}`:''}.`,true);
       } else {
-        renderHealth(`Background browser worker ${data.worker.state||'offline'}.`,` Queued work is not currently executing.${data.worker.detail?` ${data.worker.detail}.`:''}`,false);
+        renderHealth(`Background browser worker ${data.worker.state||'offline'}.`,` ${data.worker.transition_at?`Phase started ${data.worker.transition_at}. `:''}Queued work is not currently executing.${data.worker.detail?` ${data.worker.detail}.`:''}`,false);
       }
       Object.entries(data.group_counts||{}).forEach(([key,value])=>{const el=document.querySelector(`[data-count="${key}"]`);if(el)el.textContent=value});
+      renderJobs(data.activity||[]);
     } catch(error) {
       renderHealth('Worker status unavailable.',' DataSniper could not verify the service. Check the application log or restart the container.',false);
       state.textContent='status unavailable';
