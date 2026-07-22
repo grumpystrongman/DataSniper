@@ -169,3 +169,46 @@ def test_registry_refresh_deduplicates_existing_entities(tmp_path):
     assert production.ingest_registry_csv("california", csv_body)["added"] == 0
     with app.db() as conn:
         assert conn.execute("SELECT COUNT(*) FROM broker_registry").fetchone()[0] == 1
+
+
+def test_submission_transactions_update_task_and_preserve_history(tmp_path):
+    app, _ = configure(tmp_path)
+    with app.db() as conn:
+        conn.execute(
+            """INSERT INTO requests (broker_slug,broker_name,url,status,prepared_at)
+            VALUES('spokeo','Spokeo','https://www.spokeo.com/optout','prepared',?)""",
+            (app.utcnow(),),
+        )
+        request_id = conn.execute("SELECT id FROM requests").fetchone()[0]
+
+    app.record_submission_transaction(
+        request_id, "matching", "matched", page_url="https://www.spokeo.com/optout",
+        match_score=80, detail="Name and address matched", automated=True,
+    )
+    app.record_submission_transaction(
+        request_id, "captcha", "blocked", page_url="https://www.spokeo.com/optout",
+        match_score=80, detail="Human verification required", automated=True,
+    )
+
+    history = app.get_submission_transactions(request_id)
+    assert [item["outcome"] for item in history] == ["blocked", "matched"]
+    with app.db() as conn:
+        row = conn.execute("SELECT automation_status,match_score FROM requests").fetchone()
+        stored_url = conn.execute("SELECT page_url FROM submission_transactions LIMIT 1").fetchone()[0]
+    assert tuple(row) == ("human_action_required", 80)
+    assert "spokeo.com" not in stored_url
+    assert history[0]["page_url"] == "https://www.spokeo.com/optout"
+
+
+def test_submission_transaction_rejects_unknown_state(tmp_path):
+    app, _ = configure(tmp_path)
+    with app.db() as conn:
+        conn.execute(
+            """INSERT INTO requests (broker_slug,broker_name,url,status,prepared_at)
+            VALUES('spokeo','Spokeo','https://www.spokeo.com/optout','prepared',?)""",
+            (app.utcnow(),),
+        )
+        request_id = conn.execute("SELECT id FROM requests").fetchone()[0]
+    import pytest
+    with pytest.raises(ValueError):
+        app.record_submission_transaction(request_id, "bypass", "captcha_solved")
