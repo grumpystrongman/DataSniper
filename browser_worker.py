@@ -57,12 +57,31 @@ class QueueStore:
     def recover_stale(self, minutes: int = 15) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self.db_factory() as conn:
-            cur = conn.execute(
-                """UPDATE runner_queue SET status='queued',worker_id=NULL,started_at=NULL,
-                heartbeat_at=NULL,last_error='Worker stopped before the job completed'
-                WHERE status='running' AND COALESCE(heartbeat_at,started_at) < ?""", (cutoff,)
-            )
-            return cur.rowcount
+            stale = conn.execute(
+                """SELECT id,request_id FROM runner_queue WHERE status='running'
+                AND COALESCE(heartbeat_at,started_at) < ?""", (cutoff,)
+            ).fetchall()
+            recovered = 0
+            for row in stale:
+                queued = conn.execute(
+                    """SELECT id FROM runner_queue WHERE request_id=? AND status='queued'
+                    AND id<>? LIMIT 1""", (row["request_id"], row["id"])
+                ).fetchone()
+                if queued:
+                    conn.execute(
+                        """UPDATE runner_queue SET status='cancelled',stage='superseded',
+                        finished_at=?,heartbeat_at=?,last_error=? WHERE id=?""",
+                        (_now(), _now(), "Stale attempt superseded by an already queued retry", row["id"]),
+                    )
+                else:
+                    conn.execute(
+                        """UPDATE runner_queue SET status='queued',stage='scheduled',worker_id=NULL,
+                        started_at=NULL,heartbeat_at=NULL,
+                        last_error='Worker stopped before the job completed' WHERE id=?""",
+                        (row["id"],),
+                    )
+                recovered += 1
+            return recovered
 
     def worker_status(self, state: str, detail: str = "") -> None:
         with self.db_factory() as conn:
