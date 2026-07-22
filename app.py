@@ -245,8 +245,7 @@ def init_db() -> None:
                 started_at TEXT,
                 heartbeat_at TEXT,
                 finished_at TEXT,
-                last_error TEXT NOT NULL DEFAULT '',
-                UNIQUE(request_id, status)
+                last_error TEXT NOT NULL DEFAULT ''
             );
             """
         )
@@ -281,6 +280,58 @@ def init_db() -> None:
         for name, definition in queue_migrations.items():
             if name not in queue_columns:
                 conn.execute(f"ALTER TABLE runner_queue ADD COLUMN {name} {definition}")
+        # Older databases used UNIQUE(request_id, status). That constraint
+        # prevents legitimate repeated attempts and can make stale recovery
+        # fail when a request already has a queued row. SQLite cannot drop a
+        # table constraint in place, so rebuild it once with the correct rule:
+        # retain attempt history, but allow only one active attempt.
+        queue_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='runner_queue'"
+        ).fetchone()["sql"]
+        if "UNIQUE(request_id, status)" in queue_sql.replace("\n", " "):
+            conn.executescript(
+                """
+                DROP INDEX IF EXISTS runner_queue_one_active_request;
+                CREATE TABLE runner_queue_v2 (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                    created_at TEXT NOT NULL,
+                    run_after TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'queued',
+                    reason TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    worker_id TEXT,
+                    stage TEXT NOT NULL DEFAULT 'scheduled',
+                    started_at TEXT,
+                    heartbeat_at TEXT,
+                    finished_at TEXT,
+                    last_error TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO runner_queue_v2
+                SELECT id,request_id,created_at,run_after,status,reason,attempts,
+                       worker_id,stage,started_at,heartbeat_at,finished_at,last_error
+                FROM runner_queue;
+                DROP TABLE runner_queue;
+                ALTER TABLE runner_queue_v2 RENAME TO runner_queue;
+                """
+            )
+            # Legacy data may contain both a queued and running row. Keep the
+            # newest active attempt and close the others without deleting its
+            # audit history.
+            conn.execute(
+                """UPDATE runner_queue SET status='cancelled',stage='superseded',
+                   finished_at=COALESCE(finished_at,?),
+                   last_error='Superseded during queue integrity migration'
+                   WHERE status IN ('queued','running') AND id NOT IN (
+                     SELECT MAX(id) FROM runner_queue
+                     WHERE status IN ('queued','running') GROUP BY request_id
+                   )""",
+                (utcnow(),),
+            )
+        conn.execute(
+            """CREATE UNIQUE INDEX IF NOT EXISTS runner_queue_one_active_request
+            ON runner_queue(request_id) WHERE status IN ('queued','running')"""
+        )
         for broker in BROKERS:
             adapter = adapter_for(broker["slug"], broker["url"])
             conn.execute(

@@ -83,6 +83,84 @@ def test_stale_running_job_is_recovered(tmp_path, monkeypatch):
     assert "stopped" in row["last_error"]
 
 
+def test_queue_schema_keeps_history_but_allows_only_one_active_attempt(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='completed'")
+        conn.execute(
+            "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason) VALUES(?,?,?,'completed','history')",
+            (request_id, now, now),
+        )
+        conn.execute(
+            "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason) VALUES(?,?,?,'queued','retry')",
+            (request_id, now, now),
+        )
+        try:
+            conn.execute(
+                "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason) VALUES(?,?,?,'running','duplicate')",
+                (request_id, now, now),
+            )
+            assert False, "a second active attempt must be rejected"
+        except app.sqlite3.IntegrityError:
+            pass
+
+
+def test_stale_recovery_handles_legacy_queued_running_collision(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute("DROP INDEX runner_queue_one_active_request")
+        conn.execute("UPDATE runner_queue SET status='running',started_at=?,heartbeat_at=?,worker_id='dead'", (stale, stale))
+        conn.execute(
+            "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason) VALUES(?,?,?,'queued','new retry')",
+            (request_id, now, now),
+        )
+    assert QueueStore(app.db, "new").recover_stale() == 1
+    with app.db() as conn:
+        rows = conn.execute("SELECT status,last_error FROM runner_queue WHERE request_id=? ORDER BY id", (request_id,)).fetchall()
+    assert [row["status"] for row in rows] == ["cancelled", "queued"]
+    assert "superseded" in rows[0]["last_error"].lower()
+
+
+def test_init_migrates_deployed_unique_status_queue_with_conflicting_active_rows(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute("DROP INDEX runner_queue_one_active_request")
+        conn.execute("ALTER TABLE runner_queue RENAME TO runner_queue_new_schema")
+        conn.execute(
+            """CREATE TABLE runner_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, request_id INTEGER NOT NULL,
+                created_at TEXT NOT NULL, run_after TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued', reason TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, worker_id TEXT,
+                stage TEXT NOT NULL DEFAULT 'scheduled', started_at TEXT,
+                heartbeat_at TEXT, finished_at TEXT, last_error TEXT NOT NULL DEFAULT '',
+                UNIQUE(request_id, status))"""
+        )
+        conn.execute(
+            """INSERT INTO runner_queue SELECT * FROM runner_queue_new_schema"""
+        )
+        conn.execute("UPDATE runner_queue SET status='running',started_at=?,heartbeat_at=?", (now, now))
+        conn.execute(
+            "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason) VALUES(?,?,?,'queued','retry')",
+            (request_id, now, now),
+        )
+        conn.execute("DROP TABLE runner_queue_new_schema")
+
+    app.init_db()
+
+    with app.db() as conn:
+        rows = conn.execute("SELECT status FROM runner_queue WHERE request_id=? ORDER BY id", (request_id,)).fetchall()
+        index = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='index' AND name='runner_queue_one_active_request'"
+        ).fetchone()
+    assert [row["status"] for row in rows] == ["cancelled", "queued"]
+    assert "WHERE status IN ('queued','running')" in index["sql"]
+
+
 def test_worker_heartbeat_is_real_not_configuration_flag(tmp_path, monkeypatch):
     configured_db(tmp_path, monkeypatch)
     monkeypatch.setenv("DATASNIPER_BROWSER_WORKER", "1")
