@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import app
-from browser_worker import BrowserResult, BrowserWorker, QueueStore, form_profile
+from browser_worker import BrowserResult, BrowserWorker, QueueStore, WorkerSupervisor, form_profile
 
 
 class FakeExecutor:
@@ -123,3 +123,53 @@ def test_reviewed_failure_can_be_requeued(tmp_path, monkeypatch):
         row = conn.execute("SELECT status,last_error FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
     assert row["status"] == "queued"
     assert row["last_error"] == ""
+
+
+def test_completed_work_can_be_explicitly_rerun_with_history(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='completed',stage='confirmation',finished_at=?", (app.utcnow(),))
+        conn.execute("UPDATE requests SET automation_status='awaiting_response'")
+    assert app.requeue_automation_request(request_id, allow_terminal=True) == "queued"
+    with app.db() as conn:
+        row = conn.execute("SELECT status,stage,finished_at FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+        history = conn.execute("SELECT detail FROM submission_transactions WHERE request_id=?", (request_id,)).fetchall()
+    assert tuple(row) == ("queued", "scheduled", None)
+    assert any("new automation attempt" in item["detail"] for item in history)
+
+
+def test_bulk_manual_action_does_not_interrupt_running_work(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='running'")
+    response = app.bulk_automation_action("manual", [request_id])
+    assert response.status_code == 303
+    with app.db() as conn:
+        request = conn.execute("SELECT automation_status FROM requests WHERE id=?", (request_id,)).fetchone()
+    assert request["automation_status"] == "queued"
+
+
+def test_worker_supervisor_restarts_without_parallel_workers():
+    workers = []
+
+    class FakeWorker:
+        def __init__(self):
+            import threading
+            self.stop_event = threading.Event()
+            self.store = type("Store", (), {"worker_status": lambda *args: None})()
+            workers.append(self)
+
+        def run_forever(self):
+            self.stop_event.wait()
+
+    supervisor = WorkerSupervisor(FakeWorker)
+    assert supervisor.start()["state"] == "starting"
+    assert supervisor.restart()["state"] == "restarting"
+    for _ in range(100):
+        if len(workers) == 2:
+            break
+        import time
+        time.sleep(0.01)
+    assert len(workers) == 2
+    assert supervisor._thread and supervisor._thread.is_alive()
+    supervisor.shutdown()
