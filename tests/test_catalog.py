@@ -110,3 +110,62 @@ def test_identity_variants_are_encrypted_at_rest(tmp_path):
         stored = conn.execute("SELECT value FROM identity_variants").fetchone()[0]
     assert "Former Name" not in stored
     assert app.get_identity_variants()[0]["value"] == "Former Name"
+
+
+def test_exposure_monitor_encrypts_accounts_and_deduplicates(tmp_path, monkeypatch):
+    app, production = configure(tmp_path)
+    monkeypatch.setenv("HIBP_API_KEY", "0" * 32)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute(
+            """INSERT INTO profile
+            (id,full_name,email,phone,address,city,state,postal_code,birth_year,helper_name,created_at,updated_at)
+            VALUES(1,?,?,?,?,?,?,?,?,?,?,?)""",
+            (app.encrypt("Test Person"), app.encrypt("breached@example.com"), "", "", "", "VA", "", "", "", now, now),
+        )
+
+    class FakeClient:
+        def get(self, url, params=None):
+            assert "breached%40example.com" in url
+            payload = [{
+                "Name": "ExampleBreach", "Title": "Example Breach",
+                "BreachDate": "2025-01-02", "DataClasses": ["Email addresses", "Passwords"],
+            }]
+            return httpx.Response(200, json=payload, request=httpx.Request("GET", url))
+
+    assert production.audit_exposures(FakeClient())["new"] == 1
+    assert production.audit_exposures(FakeClient())["new"] == 0
+    with app.db() as conn:
+        row = conn.execute("SELECT account,severity,status FROM exposure_findings").fetchone()
+        assert conn.execute("SELECT COUNT(*) FROM exposure_findings").fetchone()[0] == 1
+    assert "breached@example.com" not in row["account"]
+    assert app.decrypt(row["account"]) == "breached@example.com"
+    assert tuple(row)[1:] == ("critical", "new")
+
+
+def test_exposure_monitor_is_optional_without_api_key(tmp_path, monkeypatch):
+    _, production = configure(tmp_path)
+    monkeypatch.delenv("HIBP_API_KEY", raising=False)
+    assert production.audit_exposures() == {"status": "not_configured", "checked": 0, "new": 0}
+
+
+def test_official_registry_import_tracks_hundreds_without_creating_tasks(tmp_path):
+    app, production = configure(tmp_path)
+    rows = ["Registration ID,Data Broker Name,Website,Delete URL"]
+    rows.extend(
+        f"{index},Broker {index},https://broker{index}.example,https://broker{index}.example/delete"
+        for index in range(1, 301)
+    )
+    result = production.ingest_registry_csv("california", "\n".join(rows))
+    assert result == {"seen": 300, "added": 300}
+    assert app.registry_summary() == {"new": 300, "total": 300}
+    assert app.get_requests() == []
+
+
+def test_registry_refresh_deduplicates_existing_entities(tmp_path):
+    app, production = configure(tmp_path)
+    csv_body = "Registration ID,Data Broker Name,Delete URL\n123,Example Data,https://example.com/privacy"
+    assert production.ingest_registry_csv("california", csv_body)["added"] == 1
+    assert production.ingest_registry_csv("california", csv_body)["added"] == 0
+    with app.db() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM broker_registry").fetchone()[0] == 1
