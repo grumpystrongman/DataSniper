@@ -4,23 +4,25 @@
   <h1>Automation Center</h1>
   <p class="muted">DataSniper runs supported privacy work and leaves only identity checks, CAPTCHAs, legal attestations, and ambiguous matches for you.</p>
   {% if request.query_params.get('control_state') %}
-  <div class="{{ 'notice' if request.query_params.get('control_state') in ['offline','stopping','restarting'] else 'good' }}" role="status" aria-live="polite">
+  <div class="{{ 'good' if request.query_params.get('control_state') == 'online' else 'notice' }}" role="status" aria-live="polite">
     <strong>{{ request.query_params.get('control_action')|title }} request received:</strong>
     {{ request.query_params.get('control_state').replace('_',' ') }}{% if request.query_params.get('control_detail') %} — {{ request.query_params.get('control_detail') }}{% endif %}
   </div>
   {% endif %}
+  <div id="worker-health" data-state="{{ overview.worker.state }}" class="{{ 'good' if overview.worker.online else 'notice' }}" role="status" aria-live="polite">
   {% if overview.worker.online %}
-  <div class="good"><strong>Background browser worker enabled.</strong> {{ overview.running }} currently running{% if overview.worker.heartbeat %} · last heartbeat {{ overview.worker.heartbeat }}{% endif %}. This page refreshes every 5 seconds while work is active.</div>
+  <strong>Background browser worker online.</strong> <span id="worker-summary">{{ overview.running }} running · {{ overview.queue }} queued</span>{% if overview.worker.heartbeat %} · heartbeat <span id="worker-heartbeat">{{ overview.worker.heartbeat }}</span>{% endif %}.
   {% elif overview.worker.configured %}
-  <div class="notice"><strong>Background browser worker is offline.</strong> Queued work is not currently executing.{% if overview.worker.detail %} {{ overview.worker.detail }}.{% endif %} Restart DataSniper and review the service log.</div>
+  <strong>Background browser worker is offline.</strong> Queued work is not currently executing.{% if overview.worker.detail %} <span id="worker-detail">{{ overview.worker.detail }}</span>.{% else %}<span id="worker-detail"></span>{% endif %}
   {% else %}
-  <div class="notice"><strong>Browser worker auto-start is disabled.</strong> Start it below for this session, or set <code>DATASNIPER_BROWSER_WORKER=1</code> to start it whenever DataSniper launches.</div>
+  <strong>Browser worker auto-start is disabled.</strong> Start it below for this session, or set <code>DATASNIPER_BROWSER_WORKER=1</code> to start it whenever DataSniper launches.<span id="worker-detail" hidden></span>
   {% endif %}
+  </div>
   <div class="actions" style="margin-top:16px">
     <form method="post" action="/automation/worker/start"><button class="success" type="submit">Start worker</button></form>
     <form method="post" action="/automation/worker/restart"><button type="submit">Restart worker</button></form>
     <form method="post" action="/automation/worker/stop"><button class="secondary" type="submit">Stop safely</button></form>
-    <span class="muted">Service state: {{ overview.worker.state.replace('_',' ') }}</span>
+    <span class="muted">Service state: <strong id="worker-state">{{ overview.worker.state.replace('_',' ') }}</strong> · checked <span id="worker-checked">now</span></span>
   </div>
   <div class="grid">
     <div><div class="metric">{{ overview.full }}</div><div class="muted">fully automated</div></div>
@@ -29,30 +31,6 @@
     <div><div class="metric">{{ overview.queue }}</div><div class="muted">queued</div></div>
     <div><div class="metric">{{ overview.attention }}</div><div class="muted">need attention</div></div>
   </div>
-</div>
-<div class="card">
-  <h2>Live execution</h2>
-  {% for job in overview.activity %}
-  <div class="task-row">
-    <div><strong>{{ job.broker_name }}</strong><br><span class="status {{ job.status }}">{{ job.status }}</span> · {{ (job.stage or 'scheduled').replace('_',' ') }}
-      {% if job.last_error %}<br><span class="next-action">{{ job.last_error }}</span>{% endif %}</div>
-    <small>queued {{ job.created_at }}{% if job.started_at %}<br>started {{ job.started_at }}{% endif %}{% if job.heartbeat_at %}<br>updated {{ job.heartbeat_at }}{% endif %}{% if job.finished_at %}<br>finished {{ job.finished_at }}{% endif %}</small>
-  </div>
-  {% else %}<p>No browser jobs have been scheduled.</p>{% endfor %}
-</div>
-{% if overview.running or overview.queue %}<script>setTimeout(()=>location.reload(),5000)</script>{% endif %}
-<div class="card">
-  <h2>Authorization policy</h2>
-  <p class="muted">A broker must also be authorized below before DataSniper can submit. CAPTCHA, ID upload, consent, and legal attestations always pause.</p>
-  <form method="post" action="/automation/policy">
-    <select name="policy">
-      <option value="ask" {% if policy == 'ask' %}selected{% endif %}>Always ask before submission</option>
-      <option value="high_confidence" {% if policy == 'high_confidence' %}selected{% endif %}>Submit high-confidence matches</option>
-      <option value="automatic" {% if policy == 'automatic' %}selected{% endif %}>Run authorized supported workflows automatically</option>
-    </select>
-    <button type="submit">Save policy</button>
-  </form>
-  <p><strong>Mailbox reconciliation:</strong> {{ 'configured' if mail_configured else 'not configured' }}. Message bodies are classified locally and are not retained.</p>
 </div>
 {% set group_labels = {
   'attention': ('Your action needed', 'CAPTCHAs, legal fields, missing information, and ambiguous forms you can unblock.'),
@@ -63,13 +41,13 @@
   'completed': ('Completed', 'Confirmed removals and requests that do not apply.'),
   'not_started': ('Not started', 'Known brokers that have not entered the automation queue.')
 } %}
-<div class="card">
-  <h2>Broker automation matrix</h2>
-  <p class="muted">Grouped as a work queue by the next useful action. Open an item to see what DataSniper filled, why it paused, and the latest timestamps.</p>
+<div class="card" id="work-queues">
+  <h2>Work queues — Broker automation matrix</h2>
+  <p class="muted">Filter by the next action, select the visible items, then run automation or move them to your manual queue.</p>
   <div class="filter-bar" aria-label="Filter automation work">
-    <button type="button" class="secondary filter-button active" data-filter="all">All ({{ overview["items"]|length }})</button>
+    <button type="button" class="secondary filter-button active" data-filter="all">All (<span data-count="all">{{ overview["items"]|length }}</span>)</button>
     {% for key in ['attention','running','ready','waiting','failed','completed','not_started'] %}
-    <button type="button" class="secondary filter-button" data-filter="{{ key }}">{{ group_labels[key][0] }} ({{ overview.group_counts[key] }})</button>
+    <button type="button" class="secondary filter-button" data-filter="{{ key }}">{{ group_labels[key][0] }} (<span data-count="{{ key }}">{{ overview.group_counts[key] }}</span>)</button>
     {% endfor %}
   </div>
   {% for key in ['attention','running','ready','waiting','failed','completed','not_started'] %}
@@ -110,6 +88,29 @@
     <span class="muted">Reruns keep prior transaction history and create a new audited attempt.</span>
   </form>
 </div>
+<div class="card">
+  <h2>Live execution</h2>
+  {% for job in overview.activity %}
+  <div class="task-row">
+    <div><strong>{{ job.broker_name }}</strong><br><span class="status {{ job.status }}">{{ job.status }}</span> · {{ (job.stage or 'scheduled').replace('_',' ') }}
+      {% if job.last_error %}<br><span class="next-action">{{ job.last_error }}</span>{% endif %}</div>
+    <small>queued {{ job.created_at }}{% if job.started_at %}<br>started {{ job.started_at }}{% endif %}{% if job.heartbeat_at %}<br>updated {{ job.heartbeat_at }}{% endif %}{% if job.finished_at %}<br>finished {{ job.finished_at }}{% endif %}</small>
+  </div>
+  {% else %}<p>No browser jobs have been scheduled.</p>{% endfor %}
+</div>
+<div class="card">
+  <h2>Authorization policy</h2>
+  <p class="muted">A broker must also be authorized below before DataSniper can submit. CAPTCHA, ID upload, consent, and legal attestations always pause.</p>
+  <form method="post" action="/automation/policy">
+    <select name="policy">
+      <option value="ask" {% if policy == 'ask' %}selected{% endif %}>Always ask before submission</option>
+      <option value="high_confidence" {% if policy == 'high_confidence' %}selected{% endif %}>Submit high-confidence matches</option>
+      <option value="automatic" {% if policy == 'automatic' %}selected{% endif %}>Run authorized supported workflows automatically</option>
+    </select>
+    <button type="submit">Save policy</button>
+  </form>
+  <p><strong>Mailbox reconciliation:</strong> {{ 'configured' if mail_configured else 'not configured' }}. Message bodies are classified locally and are not retained.</p>
+</div>
 <script>
 (() => {
   const groups=[...document.querySelectorAll('details[data-group]')];
@@ -122,6 +123,37 @@
   }));
   document.querySelectorAll('.item-check').forEach(check=>check.addEventListener('change',update));
   document.querySelector('#select-visible').addEventListener('click',()=>{visibleChecks().forEach(check=>check.checked=true);update()});
+  const health=document.querySelector('#worker-health');
+  const state=document.querySelector('#worker-state');
+  const checked=document.querySelector('#worker-checked');
+  const renderHealth=(title,detail,isOnline)=>{
+    health.replaceChildren();
+    const strong=document.createElement('strong');
+    strong.textContent=title;
+    health.append(strong,document.createTextNode(detail));
+    health.className=isOnline?'good':'notice';
+  };
+  const poll=async()=>{
+    try {
+      const response=await fetch('/automation/status',{headers:{Accept:'application/json'},cache:'no-store'});
+      if(!response.ok)throw new Error(`status ${response.status}`);
+      const data=await response.json();
+      state.textContent=(data.worker.state||'unknown').replaceAll('_',' ');
+      checked.textContent=new Date().toLocaleTimeString();
+      health.dataset.state=data.worker.state||'unknown';
+      if(data.worker.online){
+        renderHealth('Background browser worker online.',` ${data.running} running · ${data.queue} queued${data.worker.heartbeat?` · heartbeat ${data.worker.heartbeat}`:''}.`,true);
+      } else {
+        renderHealth(`Background browser worker ${data.worker.state||'offline'}.`,` Queued work is not currently executing.${data.worker.detail?` ${data.worker.detail}.`:''}`,false);
+      }
+      Object.entries(data.group_counts||{}).forEach(([key,value])=>{const el=document.querySelector(`[data-count="${key}"]`);if(el)el.textContent=value});
+    } catch(error) {
+      renderHealth('Worker status unavailable.',' DataSniper could not verify the service. Check the application log or restart the container.',false);
+      state.textContent='status unavailable';
+    }
+  };
+  poll();
+  setInterval(poll,2000);
 })();
 </script>
 {% endblock %}

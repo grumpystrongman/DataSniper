@@ -723,6 +723,19 @@ def automation_center(request: Request):
     })
 
 
+@app.get("/automation/status")
+def automation_status() -> dict[str, Any]:
+    """Small live payload used by the operator console to verify real worker health."""
+    overview = automation_overview()
+    return {
+        "worker": overview["worker"],
+        "queue": overview["queue"],
+        "running": overview["running"],
+        "group_counts": overview["group_counts"],
+        "checked_at": utcnow(),
+    }
+
+
 @app.post("/automation/worker/{action}")
 def control_automation_worker(action: str):
     if action not in {"start", "stop", "restart"}:
