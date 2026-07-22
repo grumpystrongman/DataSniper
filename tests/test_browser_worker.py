@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import app
-from browser_worker import BrowserResult, BrowserWorker, QueueStore, WorkerSupervisor, form_profile
+from browser_worker import BrowserResult, BrowserWorker, QueueStore, WorkerSupervisor, _FORM_SCRIPT, form_profile
 
 
 class FakeExecutor:
@@ -47,6 +47,12 @@ def make_worker(executor):
     return BrowserWorker(app.db, app.profile, app.get_identity_variants, app.setting,
                          app.record_submission_transaction, lambda *args: None, app.audit,
                          app.record_failure_diagnostic, executor)
+
+
+def test_form_diagnostics_initializes_selected_choices_before_reading_them():
+    declaration = _FORM_SCRIPT.index("let selected=[];")
+    first_read = _FORM_SCRIPT.index("diagnostics.attempted.selected_choices=[...selected];")
+    assert declaration < first_read
 
 
 def test_worker_claims_runs_and_records_live_timestamps(tmp_path, monkeypatch):
