@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import csv
+import io
 import json
 import os
 import secrets
@@ -13,7 +15,7 @@ import zipfile
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import httpx
 
@@ -25,8 +27,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import (
-    DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, refresh_due_statuses,
-    setting, sync_catalog_plan, utcnow,
+    DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, decrypt, encrypt,
+    get_identity_variants, profile, refresh_due_statuses, setting, sync_catalog_plan, utcnow,
 )
 from broker_catalog import BROKERS, CATALOG_VERSION
 
@@ -262,6 +264,122 @@ def catalog_audit_due() -> bool:
     return (datetime.now(timezone.utc) - last).total_seconds() >= 86400
 
 
+def exposure_audit_due() -> bool:
+    last_run = setting("exposure_audit_last_run")
+    if not last_run:
+        return True
+    try:
+        last = datetime.fromisoformat(last_run.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    return (datetime.now(timezone.utc) - last).total_seconds() >= 86400
+
+
+REGISTRY_SOURCES = {
+    "california": "https://cppa.ca.gov/data_broker_registry/registry.csv",
+    "california_2025_archive": "https://raw.githubusercontent.com/the-markup/investigation-data-broker-opt-out-pages/main/data/data-broker-opt-out-pages.csv",
+}
+
+
+def _registry_value(row: dict[str, str], terms: tuple[str, ...]) -> str:
+    for key_name, value in row.items():
+        normalized = " ".join(key_name.lower().replace("_", " ").split())
+        if all(term in normalized for term in terms) and value and value.strip():
+            return value.strip()
+    return ""
+
+
+def ingest_registry_csv(source: str, content: str) -> dict[str, int]:
+    """Upsert an official registry export while keeping unreviewed links out of user tasks."""
+    reader = csv.DictReader(io.StringIO(content.lstrip("\ufeff")))
+    seen = added = 0
+    now = utcnow()
+    for index, row in enumerate(reader, start=1):
+        name = (
+            _registry_value(row, ("data", "broker", "name"))
+            or _registry_value(row, ("business", "name"))
+            or _registry_value(row, ("legal", "name"))
+            or _registry_value(row, ("name",))
+        )
+        if not name:
+            continue
+        source_id = (
+            _registry_value(row, ("registration", "id"))
+            or _registry_value(row, ("registration", "number"))
+            or hashlib.sha256(name.casefold().encode()).hexdigest()[:24]
+        )
+        privacy_url = (
+            _registry_value(row, ("delete", "url"))
+            or _registry_value(row, ("privacy", "rights", "url"))
+            or _registry_value(row, ("opt", "out"))
+            or _registry_value(row, ("consumer", "request"))
+            or _registry_value(row, ("url", "original"))
+        )
+        website = _registry_value(row, ("website",)) or _registry_value(row, ("web", "site"))
+        if privacy_url and not privacy_url.lower().startswith("https://"):
+            privacy_url = ""
+        if website and not website.lower().startswith(("http://", "https://")):
+            website = ""
+        verified_names = {broker["name"].casefold() for broker in BROKERS}
+        initial_status = "verified" if name.casefold() in verified_names else "new"
+        with db() as conn:
+            existing = conn.execute(
+                "SELECT id,review_status FROM broker_registry WHERE source=? AND source_id=?",
+                (source, source_id),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """UPDATE broker_registry SET legal_name=?,website=?,privacy_url=?,
+                    last_seen_at=?,raw_record=? WHERE id=?""",
+                    (name, website, privacy_url, now, json.dumps(row), existing["id"]),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO broker_registry
+                    (source,source_id,legal_name,website,privacy_url,review_status,first_seen_at,last_seen_at,raw_record)
+                    VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (source, source_id, name, website, privacy_url, initial_status, now, now, json.dumps(row)),
+                )
+                added += 1
+        seen += 1
+    return {"seen": seen, "added": added}
+
+
+def audit_official_registries(client: httpx.Client | None = None) -> dict[str, int]:
+    own_client = client is None
+    client = client or httpx.Client(
+        follow_redirects=True, timeout=httpx.Timeout(30.0),
+        headers={"User-Agent": "DataSniper-Registry-Audit/1.0"},
+    )
+    total_seen = total_added = failed = 0
+    try:
+        for source, url in REGISTRY_SOURCES.items():
+            try:
+                response = client.get(url)
+                response.raise_for_status()
+                result = ingest_registry_csv(source, response.text)
+                total_seen += result["seen"]
+                total_added += result["added"]
+            except (httpx.HTTPError, csv.Error):
+                failed += 1
+        with db() as conn:
+            conn.execute(
+                """INSERT INTO settings(key,value) VALUES('registry_audit_last_run',?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (utcnow(),)
+            )
+        audit("registries_audited", f"{total_seen} official entries monitored; {total_added} new; {failed} source failures")
+        return {"seen": total_seen, "added": total_added, "failed": failed}
+    finally:
+        if own_client:
+            client.close()
+
+
+@app.post("/coverage/check-now")
+def check_registry_now():
+    audit_official_registries()
+    return RedirectResponse("/coverage", status_code=303)
+
+
 def audit_broker_catalog(client: httpx.Client | None = None) -> dict[str, int]:
     """Check official removal links without transmitting household identity data."""
     own_client = client is None
@@ -372,6 +490,100 @@ def check_saved_profiles(client: httpx.Client | None = None) -> dict[str, int]:
             client.close()
 
 
+def monitored_emails() -> list[str]:
+    values: list[str] = []
+    current = profile()
+    if current and current.get("email"):
+        values.append(current["email"])
+    values.extend(item["value"] for item in get_identity_variants() if item["kind"] == "email")
+    return list(dict.fromkeys(value.strip().lower() for value in values if "@" in value))
+
+
+def exposure_severity(data_classes: list[str]) -> tuple[str, str]:
+    normalized = " ".join(data_classes).lower()
+    if any(term in normalized for term in ("password", "authentication", "credit card", "bank account")):
+        return "critical", "Change the affected password anywhere it was reused, enable MFA, and review the account for unauthorized activity."
+    if any(term in normalized for term in ("phone", "physical address", "date of birth", "government")):
+        return "high", "Watch for targeted phishing and identity fraud; review account recovery details and consider a credit freeze."
+    return "medium", "Expect targeted phishing. Verify unexpected messages independently and secure the affected account."
+
+
+def audit_exposures(client: httpx.Client | None = None) -> dict[str, int | str]:
+    """Query a supported breach feed and store only matching household findings locally."""
+    api_key = os.environ.get("HIBP_API_KEY", "").strip()
+    if not api_key:
+        return {"status": "not_configured", "checked": 0, "new": 0}
+    own_client = client is None
+    client = client or httpx.Client(timeout=httpx.Timeout(15.0), headers={
+        "hibp-api-key": api_key, "user-agent": "DataSniper-Privacy-Agent/1.0",
+    })
+    checked = new_count = 0
+    try:
+        for email in monitored_emails():
+            checked += 1
+            response = client.get(f"https://haveibeenpwned.com/api/v3/breachedaccount/{quote(email, safe='')}", params={"truncateResponse": "false"})
+            if response.status_code == 404:
+                continue
+            response.raise_for_status()
+            for breach in response.json():
+                name = str(breach.get("Name") or "Unknown breach")
+                title = str(breach.get("Title") or name)
+                classes = [str(value) for value in breach.get("DataClasses", [])]
+                severity, remediation = exposure_severity(classes)
+                with db() as conn:
+                    candidates = conn.execute(
+                        "SELECT id,account FROM exposure_findings WHERE provider='hibp' AND breach_name=?",
+                        (name,),
+                    ).fetchall()
+                    match = next((row for row in candidates if decrypt(row["account"]) == email), None)
+                    if match:
+                        conn.execute("UPDATE exposure_findings SET last_seen_at=?,title=?,breach_date=?,data_classes=?,severity=?,remediation=? WHERE id=?",
+                                     (utcnow(), title, breach.get("BreachDate"), json.dumps(classes), severity, remediation, match["id"]))
+                    else:
+                        conn.execute("""INSERT INTO exposure_findings
+                            (provider,account,breach_name,title,breach_date,data_classes,severity,status,remediation,first_seen_at,last_seen_at)
+                            VALUES('hibp',?,?,?,?,?,?,'new',?,?,?)""",
+                            (encrypt(email), name, title, breach.get("BreachDate"), json.dumps(classes), severity, remediation, utcnow(), utcnow()))
+                        new_count += 1
+            time.sleep(1.6)
+        result = {"status": "complete", "checked": checked, "new": new_count}
+        with db() as conn:
+            for key_name, value in (("exposure_audit_last_run", utcnow()), ("exposure_audit_last_result", json.dumps(result))):
+                conn.execute("INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key_name, value))
+        audit("new_exposures" if new_count else "exposures_checked", f"Checked {checked} email address(es); {new_count} new exposure(s)")
+        return result
+    finally:
+        if own_client:
+            client.close()
+
+
+@app.post("/exposures/check-now")
+def check_exposures_now():
+    audit_exposures()
+    return RedirectResponse("/exposures", status_code=303)
+
+
+@app.post("/exposures/password-check")
+def password_exposure_check(password: str = Form(...)):
+    if not password:
+        raise HTTPException(400, "Enter a password to check")
+    digest = hashlib.sha1(password.encode("utf-8")).hexdigest().upper()
+    response = httpx.get(
+        f"https://api.pwnedpasswords.com/range/{digest[:5]}",
+        headers={"Add-Padding": "true", "User-Agent": "DataSniper-Privacy-Agent/1.0"}, timeout=15.0,
+    )
+    response.raise_for_status()
+    count = 0
+    for line in response.text.splitlines():
+        suffix, _, occurrences = line.partition(":")
+        if suffix == digest[5:]:
+            count = int(occurrences or 0)
+            break
+    result = "exposed" if count else "not_found"
+    audit("password_exposure_check", f"Password hash range checked: {result}; password was not stored")
+    return RedirectResponse(f"/exposures?password_result={result}&count={count}", status_code=303)
+
+
 @app.post("/admin/backup")
 def backup_now():
     create_backup()
@@ -400,6 +612,9 @@ def monitor_loop() -> None:
             if os.environ.get("DATASNIPER_CATALOG_AUDIT", "1") == "1" and catalog_audit_due():
                 audit_broker_catalog()
                 check_saved_profiles()
+                audit_official_registries()
+            if os.environ.get("DATASNIPER_EXPOSURE_AUDIT", "1") == "1" and exposure_audit_due():
+                audit_exposures()
             if os.environ.get("DATASNIPER_AUTOBACKUP", "1") == "1":
                 newest = max(BACKUP_DIR.glob("*.zip"), key=lambda p: p.stat().st_mtime, default=None)
                 if newest is None or time.time() - newest.stat().st_mtime > 7 * 86400:
