@@ -36,12 +36,17 @@ class Adapter:
 
 GENERIC_FIELDS = {
     "full_name": ("full name", "fullname", "name"),
+    "first_name": ("first name", "firstname", "given name", "givenname"),
+    "middle_name": ("middle name", "middlename", "middle initial"),
+    "last_name": ("last name", "lastname", "family name", "surname"),
     "email": ("email", "email address"),
     "phone": ("phone", "telephone", "mobile"),
     "address": ("street", "address"),
     "city": ("city",),
     "state": ("state", "province"),
     "postal_code": ("postal", "zipcode", "zip code", "zip"),
+    "birth_year": ("birth year", "year of birth", "birthyear"),
+    "country": ("country",),
 }
 
 

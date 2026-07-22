@@ -26,6 +26,18 @@ def _now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
+def form_profile(profile: dict[str, str]) -> dict[str, str]:
+    """Derive common form fields without storing another copy of identity data."""
+    result = {key: value for key, value in profile.items() if isinstance(value, str)}
+    parts = result.get("full_name", "").split()
+    if parts:
+        result.setdefault("first_name", parts[0])
+        result.setdefault("last_name", parts[-1] if len(parts) > 1 else "")
+        result.setdefault("middle_name", " ".join(parts[1:-1]))
+    result.setdefault("country", "United States")
+    return result
+
+
 @dataclass
 class BrowserResult:
     outcome: str
@@ -161,10 +173,21 @@ class PlaywrightExecutor:
             text = page.locator("body").inner_text(timeout=15_000)[:250_000]
             decision = match_identity(text, profile, variants)
             allowed, reason = may_submit(policy, decision["score"], decision["strong_identifier"], adapter, bool(job["authorized"]))
-            result = page.evaluate(_FORM_SCRIPT, {"profile": profile, "aliases": adapter.field_aliases, "submit": allowed})
-            result["match_score"] = decision["score"]
-            if result["outcome"] in {"blocked", "needs_review"}:
-                return BrowserResult(**result, page_url=page.url, screenshot=page.screenshot(full_page=True))
+            supplied = form_profile(profile)
+            result = None
+            for step in range(4):
+                result = page.evaluate(_FORM_SCRIPT, {"profile": supplied, "aliases": adapter.field_aliases, "submit": allowed})
+                result["match_score"] = decision["score"]
+                if result["outcome"] != "advanced":
+                    break
+                progress(f"form_step_{step + 2}")
+                page.wait_for_timeout(1200)
+            assert result is not None
+            if result["outcome"] in {"blocked", "needs_review", "advanced"}:
+                if result["outcome"] == "advanced":
+                    result.update(outcome="needs_review", stage="inspection", detail="The form exceeded four automatic steps; review is required")
+                return BrowserResult(**{key: result[key] for key in ("outcome", "stage", "detail", "match_score")},
+                                     page_url=page.url, screenshot=page.screenshot(full_page=True))
             if not allowed:
                 return BrowserResult("needs_review", "authorization", reason.replace("_", " "), page.url, decision["score"])
             progress("submitting_form")
@@ -187,22 +210,41 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
   const visible=(document.body?.innerText||'').toLowerCase();
   const captcha=!!document.querySelector('iframe[src*="captcha" i],.g-recaptcha,[class*="captcha" i],[id*="captcha" i],[data-sitekey]')||/verify you are human|complete the captcha|security challenge/.test(visible);
   const controls=[...document.querySelectorAll('input,textarea,select')].filter(e=>!e.disabled&&e.type!=='hidden');
-  let filled=0;
+  let filled=[];
+  const describe=e=>`${e.name||''} ${e.id||''} ${e.placeholder||''} ${e.getAttribute('aria-label')||''} ${e.labels?[...e.labels].map(x=>x.innerText).join(' '):''}`.toLowerCase();
+  const setValue=(el,value)=>{const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:el.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;setter?setter.call(el,value):el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
   for(const [field,names] of Object.entries(aliases)) {
     if(!profile[field]) continue;
-    const el=controls.find(e=>{const l=e.labels?[...e.labels].map(x=>x.innerText).join(' '):'';const t=`${e.name||''} ${e.id||''} ${e.placeholder||''} ${e.getAttribute('aria-label')||''} ${l}`.toLowerCase();return !['checkbox','radio','file','submit','button'].includes(e.type)&&names.some(n=>t.includes(n));});
-    if(el&&!el.value){el.value=profile[field];el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));filled++;}
+    const el=controls.find(e=>!['checkbox','radio','file','submit','button'].includes(e.type)&&names.some(n=>describe(e).includes(n)));
+    if(el&&!el.value){
+      if(el.tagName==='SELECT'){const target=[...el.options].find(o=>o.value.toLowerCase()===profile[field].toLowerCase()||o.text.toLowerCase()===profile[field].toLowerCase()||o.text.toLowerCase().includes(profile[field].toLowerCase()));if(target)setValue(el,target.value);else continue;}
+      else setValue(el,profile[field]);
+      filled.push(field);
+    }
+  }
+  let selected=[];
+  const deletion=/delete|deletion|erase|erasure|remove my (personal )?(data|information)|do not sell|opt.?out/;
+  const dangerous=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear/;
+  for(const el of controls.filter(e=>e.type==='radio'&&!e.checked)){
+    const label=describe(el);if(deletion.test(label)&&!dangerous.test(label)){el.click();selected.push('deletion request');break;}
+  }
+  for(const el of controls.filter(e=>e.tagName==='SELECT'&&!e.value)){
+    const context=describe(el);if(!/request|right|action|privacy/.test(context))continue;
+    const option=[...el.options].find(o=>deletion.test(o.text.toLowerCase())&&!dangerous.test(o.text.toLowerCase()));if(option){setValue(el,option.value);selected.push('deletion request');}
   }
   const risky=controls.filter(e=>['checkbox','radio','file'].includes(e.type)&&e.required&&!e.checked);
   const missing=controls.filter(e=>e.required&&!e.value&&!e.checked&&!['checkbox','radio','file'].includes(e.type));
-  if(captcha)return {outcome:'blocked',stage:'captcha',detail:`Filled ${filled} field(s); CAPTCHA requires human completion`};
-  if(risky.length||missing.length)return {outcome:'needs_review',stage:'inspection',detail:`Filled ${filled} field(s); ${risky.length+missing.length} required or legal field(s) need review`};
+  const summary=`Filled ${filled.length} profile field(s)${selected.length?` and selected ${selected.join(', ')}`:''}`;
+  if(captcha)return {outcome:'blocked',stage:'captcha',detail:`${summary}; CAPTCHA requires human completion`};
+  if(risky.length||missing.length)return {outcome:'needs_review',stage:'inspection',detail:`${summary}; ${risky.length+missing.length} required or legal field(s) need review`};
   const form=controls.find(e=>e.form)?.form||document.querySelector('form');
   const button=form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
   if(!form||!button)return {outcome:'needs_review',stage:'inspection',detail:'No unambiguous submission form was found'};
-  if(!submit)return {outcome:'needs_review',stage:'authorization',detail:`Filled ${filled} field(s); submission is not authorized`};
+  if(!submit)return {outcome:'needs_review',stage:'authorization',detail:`${summary}; submission is not authorized`};
   if(!form.checkValidity())return {outcome:'needs_review',stage:'inspection',detail:'The form did not pass browser validation'};
-  form.requestSubmit(button);return {outcome:'submitted',stage:'submission',detail:`Filled ${filled} field(s) and submitted the official form`};
+  const buttonText=(button.innerText||button.value||'').toLowerCase();
+  if(/next|continue|proceed/.test(buttonText)&&!/submit|send|complete|finish|request/.test(buttonText)){button.click();return {outcome:'advanced',stage:'inspection',detail:`${summary}; advanced to the next form step`};}
+  form.requestSubmit(button);return {outcome:'submitted',stage:'submission',detail:`${summary} and submitted the official form`};
 }"""
 
 

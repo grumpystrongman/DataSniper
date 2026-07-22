@@ -42,20 +42,44 @@
   </form>
   <p><strong>Mailbox reconciliation:</strong> {{ 'configured' if mail_configured else 'not configured' }}. Message bodies are classified locally and are not retained.</p>
 </div>
+{% set group_labels = {
+  'attention': ('Your action needed', 'CAPTCHAs, legal fields, missing information, and ambiguous forms you can unblock.'),
+  'running': ('Running now', 'The background browser is actively inspecting or submitting these requests.'),
+  'ready': ('Ready and queued', 'Authorized work waiting for the background worker.'),
+  'waiting': ('Waiting on broker', 'Submitted requests awaiting confirmation or completion.'),
+  'failed': ('Failed or retry needed', 'Work that stopped with a recorded reason.'),
+  'completed': ('Completed', 'Confirmed removals and requests that do not apply.'),
+  'not_started': ('Not started', 'Known brokers that have not entered the automation queue.')
+} %}
 <div class="card">
   <h2>Broker automation matrix</h2>
-  {% for item in overview["items"] %}
+  <p class="muted">Grouped as a work queue by the next useful action. Open an item to see what DataSniper filled, why it paused, and the latest timestamps.</p>
+  {% for key in ['attention','running','ready','waiting','failed','completed','not_started'] %}
+  {% set meta = group_labels[key] %}
+  <details {% if key in ['attention','running','ready'] and overview.groups[key] %}open{% endif %}>
+    <summary><strong>{{ meta[0] }}</strong> <span class="status">{{ overview.group_counts[key] }}</span><br><span class="muted">{{ meta[1] }}</span></summary>
+    {% for item in overview.groups[key] %}
   <div class="task-row">
     <div class="details"><strong>{{ item.broker_name }}</strong><br>
       <span class="status">{{ item.support_level or 'manual' }}</span>
       <span class="muted">score {{ item.support_score }}/100 · adapter {{ item.health_status or 'untested' }} · {{ item.automation_status.replace('_',' ') }}</span>
       {% if item.match_score is not none %}<br><span class="muted">Last match: {{ item.match_score }}%</span>{% endif %}
+      {% if item.job and item.job.last_error %}<br><span class="next-action">{{ item.job.last_error }}</span>{% endif %}
+      {% if item.job %}<br><small>Stage: {{ (item.job.stage or 'scheduled').replace('_',' ') }}{% if item.job.heartbeat_at %} · updated {{ item.job.heartbeat_at }}{% endif %}</small>{% endif %}
     </div>
-    <form method="post" action="/automation/{{ item.broker_slug }}/authorization">
-      <input type="hidden" name="authorized" value="{{ 'false' if item.authorized else 'true' }}">
-      <button class="{{ 'secondary' if item.authorized else '' }}" type="submit">{{ 'Disable auto-submit' if item.authorized else 'Authorize auto-submit' }}</button>
-    </form>
+    <div class="actions">
+      <a class="button secondary" href="/task/{{ item.id }}">Review history</a>
+      {% if key in ['attention','failed'] %}
+      <form method="post" action="/automation/request/{{ item.id }}/retry"><button type="submit">Retry now</button></form>
+      {% endif %}
+      <form method="post" action="/automation/{{ item.broker_slug }}/authorization">
+        <input type="hidden" name="authorized" value="{{ 'false' if item.authorized else 'true' }}">
+        <button class="{{ 'secondary' if item.authorized else '' }}" type="submit">{{ 'Disable auto-submit' if item.authorized else 'Authorize auto-submit' }}</button>
+      </form>
+    </div>
   </div>
+    {% else %}<p class="muted">No items in this group.</p>{% endfor %}
+  </details>
   {% endfor %}
 </div>
 {% endblock %}

@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import app
-from browser_worker import BrowserResult, BrowserWorker, QueueStore
+from browser_worker import BrowserResult, BrowserWorker, QueueStore, form_profile
 
 
 class FakeExecutor:
@@ -88,3 +88,38 @@ def test_worker_heartbeat_is_real_not_configuration_flag(tmp_path, monkeypatch):
     worker = app.automation_overview()["worker"]
     assert worker["online"] is True
     assert worker["heartbeat"]
+
+
+def test_form_profile_derives_split_name_and_country_without_persisting_it():
+    original = {"full_name": "Jeff Allen Example", "email": "jeff@example.com"}
+    derived = form_profile(original)
+    assert derived["first_name"] == "Jeff"
+    assert derived["middle_name"] == "Allen"
+    assert derived["last_name"] == "Example"
+    assert derived["country"] == "United States"
+    assert "first_name" not in original
+
+
+def test_automation_overview_groups_work_by_next_action(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    overview = app.automation_overview()
+    assert [item["id"] for item in overview["groups"]["ready"]] == [request_id]
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='attention',stage='captcha',last_error='CAPTCHA requires human completion'")
+        conn.execute("UPDATE requests SET automation_status='human_action_required'")
+    overview = app.automation_overview()
+    assert overview["group_counts"]["attention"] == 1
+    assert overview["groups"]["attention"][0]["job"]["stage"] == "captcha"
+
+
+def test_reviewed_failure_can_be_requeued(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='failed',last_error='Temporary failure'")
+        conn.execute("UPDATE requests SET automation_status='failed'")
+    response = app.retry_automation_request(request_id)
+    assert response.status_code == 303
+    with app.db() as conn:
+        row = conn.execute("SELECT status,last_error FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+    assert row["status"] == "queued"
+    assert row["last_error"] == ""
