@@ -296,3 +296,80 @@ class BrowserWorker:
         finally:
             self.store.worker_status("offline", "Worker stopped")
             self.executor.close()
+
+
+class WorkerSupervisor:
+    """Own the worker lifecycle so operators can control it without killing a submission."""
+
+    def __init__(self, worker_factory: Callable[[], BrowserWorker]):
+        self.worker_factory = worker_factory
+        self._lock = threading.RLock()
+        self._worker: BrowserWorker | None = None
+        self._thread: threading.Thread | None = None
+        self._restart_thread: threading.Thread | None = None
+        self._desired_running = False
+
+    def _alive(self) -> bool:
+        return bool(self._thread and self._thread.is_alive())
+
+    def start(self) -> dict[str, str]:
+        with self._lock:
+            self._desired_running = True
+            if self._alive():
+                if self._worker and self._worker.stop_event.is_set():
+                    if not self._restart_thread or not self._restart_thread.is_alive():
+                        previous = self._thread
+                        self._restart_thread = threading.Thread(
+                            target=self._restart_after, args=(previous,), daemon=True,
+                            name="datasniper-browser-worker-restart",
+                        )
+                        self._restart_thread.start()
+                    return {"state": "restarting", "detail": "Worker will start after the previous instance stops"}
+                return {"state": "online", "detail": "Browser worker is already running"}
+            self._worker = self.worker_factory()
+            self._thread = threading.Thread(
+                target=self._worker.run_forever, daemon=True, name="datasniper-browser-worker"
+            )
+            self._thread.start()
+            return {"state": "starting", "detail": "Browser worker is starting"}
+
+    def stop(self) -> dict[str, str]:
+        with self._lock:
+            self._desired_running = False
+            if not self._alive() or not self._worker:
+                return {"state": "offline", "detail": "Browser worker is already stopped"}
+            self._worker.store.worker_status("stopping", "Stopping after the current browser attempt finishes")
+            self._worker.stop_event.set()
+            return {"state": "stopping", "detail": "Worker will stop safely after its current attempt"}
+
+    def restart(self) -> dict[str, str]:
+        with self._lock:
+            self._desired_running = True
+            if not self._alive() or not self._worker:
+                return self.start()
+            self._worker.store.worker_status("restarting", "Restart queued; draining the current browser attempt")
+            self._worker.stop_event.set()
+            if not self._restart_thread or not self._restart_thread.is_alive():
+                previous = self._thread
+                self._restart_thread = threading.Thread(
+                    target=self._restart_after, args=(previous,), daemon=True,
+                    name="datasniper-browser-worker-restart",
+                )
+                self._restart_thread.start()
+            return {"state": "restarting", "detail": "Worker will restart after its current attempt"}
+
+    def _restart_after(self, previous: threading.Thread | None) -> None:
+        if previous:
+            previous.join()
+        with self._lock:
+            if not self._desired_running:
+                return
+            self._worker = None
+            self._thread = None
+        self.start()
+
+    def shutdown(self, timeout: float = 10) -> None:
+        self.stop()
+        thread = self._thread
+        if thread:
+            thread.join(timeout=timeout)
