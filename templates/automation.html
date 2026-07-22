@@ -95,6 +95,8 @@
     <select name="action" aria-label="Bulk action">
       <option value="run">Run or rerun automation</option>
       <option value="manual">Move to my manual work</option>
+      <option value="archive_unreachable">Archive — URL unavailable or retired</option>
+      <option value="archive_unmanageable">Archive — cannot resolve automatically or manually</option>
     </select>
     <button type="submit">Apply to selected</button>
     <button class="secondary" type="button" id="select-all">Select all items</button>
@@ -105,9 +107,18 @@
 </div>
 <div class="card" id="failure-diagnostics">
   <h2>Failure diagnostics</h2>
-  <p class="muted">When automation stops, DataSniper records what the page appeared to ask for, the visible controls and choices, the attempted action, and the blocker. Entered personal values are excluded.</p>
+  <p class="muted">The default view and export contain only the most recent run, so resolved defects and older attempts do not obscure the work you can fix. Entered personal values are excluded.</p>
   <div class="actions">
-    <a class="button" href="/automation/failure-report">Export troubleshooting report</a>
+    <a class="button" href="/automation/failure-report?scope={{ diagnostic_scope }}">Export {{ 'latest run' if diagnostic_scope == 'latest' else 'all retained runs' }}</a>
+    <a class="button secondary" href="/automation?failure_scope={{ 'all' if diagnostic_scope == 'latest' else 'latest' }}#failure-diagnostics">Show {{ 'all retained runs' if diagnostic_scope == 'latest' else 'latest run only' }}</a>
+    <form method="post" action="/automation/failures/clear">
+      <input type="hidden" name="mode" value="older">
+      <button class="secondary" type="submit">Clear older failures</button>
+    </form>
+    <form method="post" action="/automation/failures/clear" onsubmit="return confirm('Permanently clear all stored failure diagnostics?');">
+      <input type="hidden" name="mode" value="all">
+      <button class="secondary" type="submit">Clear all failures</button>
+    </form>
     <span class="muted">{{ diagnostics|length }} captured failure(s) · {{ diagnostic_summary|length }} recurring pattern(s)</span>
   </div>
   {% if diagnostic_summary %}
