@@ -310,6 +310,9 @@ def test_automation_page_renders_broker_matrix(tmp_path):
     assert response.status_code == 200
     assert b"Broker automation matrix" in response.body
     assert b"Authorize auto-submit" in response.body
+    assert b"Restart worker" in response.body
+    assert b"Run or rerun automation" in response.body
+    assert b"Select visible" in response.body
 
 
 def test_mail_receipt_schema_deduplicates_fingerprints(tmp_path):
