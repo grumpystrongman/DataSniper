@@ -219,3 +219,31 @@ def test_worker_control_rejects_uninitialized_runtime(tmp_path, monkeypatch):
     response = TestClient(production.app, base_url="http://localhost").post("/automation/worker/start")
     assert response.status_code == 503
     assert "not initialized" in response.text
+
+
+def test_automation_status_reports_verified_worker_and_group_counts(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+
+    configured_db(tmp_path, monkeypatch)
+    response = TestClient(app.app, base_url="http://localhost").get("/automation/status")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["worker"]["online"] is False
+    assert payload["worker"]["state"] == "offline"
+    assert payload["queue"] == 1
+    assert payload["group_counts"]["ready"] == 1
+    assert payload["checked_at"]
+
+
+def test_automation_page_puts_operational_filters_next_to_controls(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    from fastapi.testclient import TestClient
+
+    response = TestClient(app.app, base_url="http://localhost").get("/automation")
+    assert response.status_code == 200
+    html = response.text
+    assert html.index("Work queues") < html.index("Live execution")
+    assert 'data-filter="attention"' in html
+    assert 'data-filter="ready"' in html
+    assert 'data-filter="failed"' in html
+    assert "fetch('/automation/status'" in html
