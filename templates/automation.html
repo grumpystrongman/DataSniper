@@ -3,6 +3,12 @@
 <div class="card">
   <h1>Automation Center</h1>
   <p class="muted">DataSniper runs supported privacy work and leaves only identity checks, CAPTCHAs, legal attestations, and ambiguous matches for you.</p>
+  {% if request.query_params.get('control_state') %}
+  <div class="{{ 'notice' if request.query_params.get('control_state') in ['offline','stopping','restarting'] else 'good' }}" role="status" aria-live="polite">
+    <strong>{{ request.query_params.get('control_action')|title }} request received:</strong>
+    {{ request.query_params.get('control_state').replace('_',' ') }}{% if request.query_params.get('control_detail') %} — {{ request.query_params.get('control_detail') }}{% endif %}
+  </div>
+  {% endif %}
   {% if overview.worker.online %}
   <div class="good"><strong>Background browser worker enabled.</strong> {{ overview.running }} currently running{% if overview.worker.heartbeat %} · last heartbeat {{ overview.worker.heartbeat }}{% endif %}. This page refreshes every 5 seconds while work is active.</div>
   {% elif overview.worker.configured %}
