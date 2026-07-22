@@ -299,9 +299,14 @@ class BrowserWorker:
         return True
 
     def run_forever(self) -> None:
-        recovered = self.store.recover_stale()
-        self.store.worker_status("launching_browser", "Starting Chromium and its isolated DataSniper profile")
         try:
+            # Keep the entire bootstrap sequence inside the failure boundary.
+            # Previously, a migration/SQLite failure in recover_stale() killed
+            # the thread before the exception handler and left the UI in
+            # "Creating the background worker" forever.
+            self.store.worker_status("initializing", "Worker thread started; checking the local queue")
+            recovered = self.store.recover_stale()
+            self.store.worker_status("launching_browser", "Starting Chromium and its isolated DataSniper profile")
             self.executor.start()
             self.store.worker_status("online", f"Chromium ready; recovered {recovered} interrupted job(s)")
             self.audit_fn("browser_worker_started", f"Browser worker and Chromium online; {recovered} interrupted job(s) recovered")
@@ -312,8 +317,13 @@ class BrowserWorker:
                     self.wake_event.clear()
         except Exception as exc:
             detail = f"{type(exc).__name__}: {str(exc)[:450]}"
-            self.store.worker_status("failed", detail)
-            self.audit_fn("browser_worker_failed", detail)
+            try:
+                self.store.worker_status("failed", detail)
+                self.audit_fn("browser_worker_failed", detail)
+            except Exception:
+                # The supervisor wrapper gets one more chance to publish the
+                # failure after a transient database lock clears.
+                raise RuntimeError(detail) from exc
         finally:
             if self.stop_event.is_set():
                 self.store.worker_status("offline", "Worker stopped")
@@ -329,6 +339,7 @@ class WorkerSupervisor:
         self._worker: BrowserWorker | None = None
         self._thread: threading.Thread | None = None
         self._restart_thread: threading.Thread | None = None
+        self._watchdog_thread: threading.Thread | None = None
         self._desired_running = False
 
     def _alive(self) -> bool:
@@ -351,10 +362,51 @@ class WorkerSupervisor:
             self._worker = self.worker_factory()
             self._worker.store.worker_status("starting", "Creating the background worker")
             self._thread = threading.Thread(
-                target=self._worker.run_forever, daemon=True, name="datasniper-browser-worker"
+                target=self._run_worker, args=(self._worker,), daemon=True, name="datasniper-browser-worker"
             )
             self._thread.start()
+            self._watchdog_thread = threading.Thread(
+                target=self._watch_startup, args=(self._worker, self._thread), daemon=True,
+                name="datasniper-browser-worker-watchdog",
+            )
+            self._watchdog_thread.start()
             return {"state": "starting", "detail": "Browser worker is starting"}
+
+    def _run_worker(self, worker: BrowserWorker) -> None:
+        """Never allow an unhandled worker exception to leave a false transitional state."""
+        try:
+            worker.run_forever()
+        except BaseException as exc:
+            detail = f"Worker thread stopped during startup: {type(exc).__name__}: {str(exc)[:400]}"
+            for _ in range(3):
+                try:
+                    worker.store.worker_status("failed", detail)
+                    return
+                except Exception:
+                    time.sleep(0.25)
+
+    def _watch_startup(self, worker: BrowserWorker, thread: threading.Thread) -> None:
+        timeout = max(5.0, float(os.environ.get("DATASNIPER_BROWSER_STARTUP_TIMEOUT", "60")))
+        deadline = time.monotonic() + timeout
+        while thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(min(0.5, max(0.05, deadline - time.monotonic())))
+            try:
+                with worker.store.db_factory() as conn:
+                    row = conn.execute(
+                        "SELECT value FROM settings WHERE key='browser_worker_state'"
+                    ).fetchone()
+                if row and row["value"] in {"online", "failed", "offline", "stopping"}:
+                    return
+            except Exception:
+                continue
+        if not thread.is_alive():
+            return
+        detail = f"Browser startup timed out after {int(timeout)} seconds; Chromium did not become ready"
+        try:
+            worker.store.worker_status("failed", detail)
+            worker.audit_fn("browser_worker_startup_timeout", detail)
+        finally:
+            worker.stop_event.set()
 
     def wake(self) -> dict[str, str]:
         """Start an offline worker or immediately notify the live worker of queued work."""

@@ -338,6 +338,38 @@ def test_browser_startup_failure_is_visible_and_not_reported_online(tmp_path, mo
     assert "Chromium executable missing" in status["detail"]
 
 
+def test_pre_browser_bootstrap_failure_does_not_stick_in_starting(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    worker = make_worker(FakeExecutor())
+    monkeypatch.setattr(worker.store, "recover_stale", lambda: (_ for _ in ()).throw(RuntimeError("queue migration failed")))
+
+    worker.run_forever()
+
+    status = app.automation_overview()["worker"]
+    assert status["state"] == "failed"
+    assert status["online"] is False
+    assert "queue migration failed" in status["detail"]
+
+
+def test_supervisor_catches_worker_thread_failure_before_status_update(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    worker = make_worker(FakeExecutor())
+    worker.run_forever = lambda: (_ for _ in ()).throw(RuntimeError("thread bootstrap failed"))
+    supervisor = WorkerSupervisor(lambda: worker)
+    try:
+        assert supervisor.start()["state"] == "starting"
+        for _ in range(100):
+            if app.automation_overview()["worker"]["state"] == "failed":
+                break
+            import time
+            time.sleep(0.01)
+        status = app.automation_overview()["worker"]
+        assert status["state"] == "failed"
+        assert "thread bootstrap failed" in status["detail"]
+    finally:
+        supervisor.shutdown()
+
+
 def test_worker_is_not_online_until_browser_is_ready(tmp_path, monkeypatch):
     configured_db(tmp_path, monkeypatch)
     executor = FakeExecutor(error=RuntimeError("unused"))
