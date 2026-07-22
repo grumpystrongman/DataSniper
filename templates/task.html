@@ -5,6 +5,7 @@
   <h1>{{ task.broker_name }}</h1>
   <p>{{ task.notes }}</p>
   <p><span class="status {{ task.status }}">{{ task.status.replace('_',' ') }}</span></p>
+  <p><strong>Automation:</strong> {{ (task.automation_status or 'not_started').replace('_',' ') }}{% if task.match_score is not none %} · match confidence {{ task.match_score }}%{% endif %}</p>
   {% if identity_variants %}<details><summary><strong>Identity variants to check ({{ identity_variants|length }})</strong></summary><ul>{% for item in identity_variants %}<li>{{ item.kind.replace('_',' ')|title }}: {{ item.value }}{% if item.label %} — {{ item.label }}{% endif %}</li>{% endfor %}</ul></details>{% endif %}
   {% if task.status == 'prepared' %}
     <div class="notice"><strong>The agent has prepared this task.</strong> Review the broker page, complete any CAPTCHA or identity check, and submit only when you are comfortable.</div>
@@ -28,6 +29,11 @@
     <p><a class="button secondary" href="{{ task.url }}" target="_blank" rel="noopener">Check it again</a></p>
     <form method="post" action="/task/{{ task.id }}/result"><input type="hidden" name="outcome" value="verification_due"><label>Reason for reopening</label><textarea name="notes"></textarea><button type="submit">Reopen this task</button></form>
   {% endif %}
+</div>
+<div class="card">
+  <h2>Automated transaction history</h2>
+  <p class="muted">The browser helper records each discovery, match, prefill, CAPTCHA pause, submission, and confirmation here.</p>
+  {% for item in transactions %}<div class="task-row"><div><strong>{{ item.stage|title }}: {{ item.outcome.replace('_',' ') }}</strong>{% if item.match_score is not none %} · {{ item.match_score }}% match{% endif %}<br><span class="muted">{{ item.detail or 'No additional detail' }}</span></div><small>{{ item.event_at }}</small></div>{% else %}<p>No automated attempts recorded yet.</p>{% endfor %}
 </div>
 <div class="card">
   <h2>Confirmation and resurfacing</h2>

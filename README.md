@@ -34,9 +34,9 @@ DataSniper turns that bureaucracy into a household workflow:
 
 1. Complete one plain-language setup.
 2. Receive one prioritized privacy task at a time.
-3. Let the browser companion fill recognized fields.
-4. Approve sensitive actions yourself.
-5. Let DataSniper track deadlines, rechecks, and resurfacing.
+3. Let the browser companion match visible records and fill recognized fields.
+4. Automatically submit supported forms, with a handoff for CAPTCHAs, consent, or ambiguity.
+5. Let DataSniper record every transaction and track confirmations, deadlines, rechecks, and resurfacing.
 
 > **You make the decisions. DataSniper handles the administrative work.**
 

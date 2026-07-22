@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "DataSniper Privacy Helper",
-  "version": "0.1.0",
-  "description": "Pairs with the local DataSniper Privacy Agent, opens the next privacy task, and assists with form entry without submitting.",
+  "version": "0.2.0",
+  "description": "Matches records, completes supported privacy forms, and records submissions in the local DataSniper agent.",
   "permissions": ["storage", "activeTab", "scripting", "tabs"],
   "host_permissions": ["http://127.0.0.1:8787/*", "https://*/*"],
   "action": {"default_popup": "popup.html", "default_title": "DataSniper Privacy Helper"}
