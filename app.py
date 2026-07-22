@@ -169,6 +169,20 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_registry_review
             ON broker_registry(review_status, legal_name);
+            CREATE TABLE IF NOT EXISTS submission_transactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                event_at TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                page_url TEXT,
+                match_score INTEGER,
+                confirmation TEXT,
+                detail TEXT NOT NULL,
+                automated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_submission_request
+            ON submission_transactions(request_id, id DESC);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
@@ -177,6 +191,8 @@ def init_db() -> None:
             "profile_check_status": "TEXT",
             "profile_checked_at": "TEXT",
             "confirmation_status": "TEXT NOT NULL DEFAULT 'not_expected'",
+            "automation_status": "TEXT NOT NULL DEFAULT 'not_started'",
+            "match_score": "INTEGER",
         }
         for name, definition in migrations.items():
             if name not in columns:
@@ -209,6 +225,56 @@ def get_evidence(request_id: int) -> list[dict[str, Any]]:
         {**dict(row), "filename": decrypt(row["filename"]), "note": decrypt(row["note"])}
         for row in rows
     ]
+
+
+def get_submission_transactions(request_id: int | None = None) -> list[dict[str, Any]]:
+    with db() as conn:
+        if request_id is None:
+            rows = conn.execute(
+                """SELECT t.*,r.broker_name FROM submission_transactions t
+                JOIN requests r ON r.id=t.request_id ORDER BY t.id DESC LIMIT 500"""
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT * FROM submission_transactions WHERE request_id=? ORDER BY id DESC",
+                (request_id,),
+            ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["page_url"] = decrypt(item.get("page_url"))
+        item["confirmation"] = decrypt(item.get("confirmation"))
+        result.append(item)
+    return result
+
+
+def record_submission_transaction(
+    request_id: int, stage: str, outcome: str, *, page_url: str = "",
+    match_score: int | None = None, confirmation: str = "", detail: str = "",
+    automated: bool = False,
+) -> None:
+    stages = {"discovery", "matching", "prefill", "captcha", "submission", "confirmation", "tracking"}
+    outcomes = {"started", "matched", "no_match", "filled", "blocked", "needs_review", "submitted", "confirmed", "failed"}
+    if stage not in stages or outcome not in outcomes:
+        raise ValueError("Unsupported submission transaction")
+    score = None if match_score is None else max(0, min(100, int(match_score)))
+    with db() as conn:
+        row = conn.execute("SELECT broker_name FROM requests WHERE id=?", (request_id,)).fetchone()
+        if not row:
+            raise LookupError("Request not found")
+        conn.execute(
+            """INSERT INTO submission_transactions
+            (request_id,event_at,stage,outcome,page_url,match_score,confirmation,detail,automated)
+            VALUES(?,?,?,?,?,?,?,?,?)""",
+            (request_id, utcnow(), stage, outcome, encrypt(page_url[:2000]) if page_url else "", score,
+             encrypt(confirmation[:500]) if confirmation else "", detail[:2000], int(automated)),
+        )
+        status = {"blocked": "human_action_required", "needs_review": "human_action_required",
+                  "submitted": "submitted", "confirmed": "confirmed", "failed": "failed",
+                  "filled": "ready_to_submit", "matched": "match_found", "no_match": "no_match"}.get(outcome, "running")
+        conn.execute("UPDATE requests SET automation_status=?,match_score=COALESCE(?,match_score) WHERE id=?",
+                     (status, score, request_id))
+    audit("automation_" + outcome, f"{row['broker_name']}: {stage} {outcome}")
 
 
 def get_exposure_findings() -> list[dict[str, Any]]:
@@ -422,6 +488,7 @@ def task(request: Request, task_id: int):
             "task": dict(row), "profile": profile(),
             "identity_variants": get_identity_variants(),
             "evidence": get_evidence(task_id),
+            "transactions": get_submission_transactions(task_id),
         }
     )
 
@@ -620,6 +687,31 @@ def api_next(token: str):
     return {"task": next_task}
 
 
+def require_extension_token(token: str) -> None:
+    expected = setting("extension_token")
+    if not expected or not secrets.compare_digest(token, expected):
+        raise HTTPException(401, "Pairing token required")
+
+
+@app.post("/api/task/{task_id}/transaction")
+def api_submission_transaction(task_id: int, payload: dict[str, Any], token: str):
+    require_extension_token(token)
+    try:
+        record_submission_transaction(
+            task_id, str(payload.get("stage", "tracking")), str(payload.get("outcome", "failed")),
+            page_url=str(payload.get("page_url", "")), match_score=payload.get("match_score"),
+            confirmation=str(payload.get("confirmation", "")), detail=str(payload.get("detail", "")),
+            automated=bool(payload.get("automated", True)),
+        )
+    except LookupError:
+        raise HTTPException(404, "Task not found")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc))
+    if payload.get("outcome") == "submitted":
+        submitted(task_id, str(payload.get("confirmation", "")))
+    return {"ok": True}
+
+
 @app.post("/api/task/{task_id}/submitted")
 def api_submitted(task_id: int, payload: dict[str, Any], token: str):
     expected = setting("extension_token")
@@ -642,6 +734,7 @@ def audit_page(request: Request):
         "events": [dict(r) for r in rows],
         "catalog_audits": [dict(r) for r in catalog_rows],
         "catalog_version": CATALOG_VERSION,
+        "submission_transactions": get_submission_transactions(),
     })
 
 
@@ -655,6 +748,7 @@ def export_data():
         "requests": requests,
         "evidence": {str(item["id"]): get_evidence(item["id"]) for item in requests},
         "exposure_findings": get_exposure_findings(),
+        "submission_transactions": get_submission_transactions(),
     }, indent=2).encode()
     digest = hashlib.sha256(payload).hexdigest()
     return {"sha256": digest, "data": base64.b64encode(payload).decode()}
