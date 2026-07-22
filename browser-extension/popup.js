@@ -87,23 +87,68 @@ async function runPage(shouldSubmit) {
         element.dispatchEvent(new Event("change", {bubbles: true}));
         filled += 1;
       }
+      const nameParts = String(p.full_name || "").trim().split(/\s+/);
+      const splitNameFields = [
+        ["first", nameParts[0] || ""],
+        ["last", nameParts.length > 1 ? nameParts[nameParts.length - 1] : ""]
+      ];
+      for (const [part, value] of splitNameFields) {
+        if (!value) continue;
+        const element = controls.find(el => {
+          if (!["text", "", "search"].includes(el.type) || el.value) return false;
+          const label = el.labels ? [...el.labels].map(item => item.innerText).join(" ") : "";
+          const text = `${el.name || ""} ${el.id || ""} ${el.placeholder || ""} ${el.getAttribute("aria-label") || ""} ${label}`.toLowerCase();
+          return text.includes(`${part} name`) || text.includes(`${part}name`);
+        });
+        if (element) {
+          element.focus(); element.value = value;
+          element.dispatchEvent(new Event("input", {bubbles: true}));
+          element.dispatchEvent(new Event("change", {bubbles: true}));
+          filled += 1;
+        }
+      }
+      // The owner explicitly queued a deletion request. Select only an
+      // unambiguous request-type choice; legal attestations and consent remain
+      // untouched and will be caught below as human-review checkpoints.
+      let deletionChoice = 0;
+      for (const select of controls.filter(el => el.tagName === "SELECT" && !el.value)) {
+        const label = select.labels ? [...select.labels].map(item => item.innerText).join(" ") : "";
+        const context = `${select.name || ""} ${select.id || ""} ${label} ${select.getAttribute("aria-label") || ""}`.toLowerCase();
+        if (!/request|privacy right|ccpa|action/.test(context)) continue;
+        const options = [...select.options].filter(option => /delete|deletion|erase|erasure/.test(option.text.toLowerCase()));
+        if (options.length === 1) {
+          select.value = options[0].value;
+          select.dispatchEvent(new Event("change", {bubbles: true}));
+          deletionChoice += 1;
+        }
+      }
+      const deleteRadios = controls.filter(el => {
+        if (el.type !== "radio" || el.checked) return false;
+        const label = el.labels ? [...el.labels].map(item => item.innerText).join(" ") : "";
+        const context = `${el.name || ""} ${el.value || ""} ${label}`.toLowerCase();
+        return /delete|deletion|erase|erasure/.test(context) && !/do not|don't|cancel/.test(context);
+      });
+      if (deleteRadios.length === 1) {
+        deleteRadios[0].click();
+        deletionChoice += 1;
+      }
       const captcha = Boolean(document.querySelector(
         'iframe[src*="captcha" i], .g-recaptcha, [class*="captcha" i], [id*="captcha" i], [data-sitekey]'
       )) || /verify you are human|complete the captcha|security challenge/.test(visible);
       const unresolved = controls.filter(el => el.required && !el.value && !el.checked);
       const consent = controls.filter(el => ["checkbox", "radio"].includes(el.type) && el.required && !el.checked);
       if (captcha) return {stage: "captcha", outcome: "blocked", page_url: location.href,
-        match_score: matchScore, detail: `Filled ${filled} field(s); CAPTCHA requires you to complete it in this tab.`, automated: true};
+        match_score: matchScore, detail: `Filled ${filled} identity field(s) and ${deletionChoice} deletion choice(s); CAPTCHA requires you to complete it in this tab.`, automated: true};
       if (unresolved.length || consent.length) return {stage: "prefill", outcome: "needs_review", page_url: location.href,
-        match_score: matchScore, detail: `Filled ${filled} field(s); ${unresolved.length} required field(s) or consent choice(s) need review.`, automated: true};
+        match_score: matchScore, detail: `Filled ${filled} identity field(s) and ${deletionChoice} deletion choice(s); ${unresolved.length} required field(s) or consent choice(s) need review.`, automated: true};
       if (!submit) return {stage: "prefill", outcome: "filled", page_url: location.href,
-        match_score: matchScore, detail: `Filled ${filled} recognized field(s); submission was not requested.`, automated: true};
+        match_score: matchScore, detail: `Filled ${filled} identity field(s) and ${deletionChoice} deletion choice(s); submission was not requested.`, automated: true};
       if (!decision.may_submit) return {stage: "submission", outcome: "needs_review", page_url: location.href,
-        match_score: matchScore, detail: `Filled ${filled} field(s); ${decision.reason.replaceAll("_", " ")}.`, automated: true};
+        match_score: matchScore, detail: `Filled ${filled} identity field(s) and ${deletionChoice} deletion choice(s); ${decision.reason.replaceAll("_", " ")}.`, automated: true};
       const form = controls.find(el => el.form)?.form || document.querySelector("form");
       const submitter = form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
       if (!form || !submitter) return {stage: "submission", outcome: "needs_review", page_url: location.href,
-        match_score: matchScore, detail: `Filled ${filled} field(s), but no unambiguous submit control was found.`, automated: true};
+        match_score: matchScore, detail: `Filled ${filled} identity field(s) and ${deletionChoice} deletion choice(s), but no unambiguous submit control was found.`, automated: true};
       if (!form.checkValidity()) {
         form.reportValidity();
         return {stage: "submission", outcome: "needs_review", page_url: location.href,
@@ -111,7 +156,7 @@ async function runPage(shouldSubmit) {
       }
       form.requestSubmit(submitter);
       return {stage: "submission", outcome: "submitted", page_url: location.href,
-        match_score: matchScore, detail: `Filled ${filled} field(s) and invoked the official form submission.`, automated: true};
+        match_score: matchScore, detail: `Filled ${filled} identity field(s), selected ${deletionChoice} deletion choice(s), and invoked the official form submission.`, automated: true};
     },
     args: [profile, shouldSubmit, decision, task.adapter]
   });
