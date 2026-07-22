@@ -10,7 +10,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
@@ -36,6 +36,12 @@ KEY_PATH = DATA_DIR / ".vault.key"
 
 app = FastAPI(title=APP_NAME)
 templates = Jinja2Templates(directory=str(ROOT / "templates"))
+_worker_control: Callable[[str], dict[str, str]] | None = None
+
+
+def register_worker_control(control: Callable[[str], dict[str, str]]) -> None:
+    global _worker_control
+    _worker_control = control
 
 def utcnow() -> str:
     return datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
@@ -370,7 +376,7 @@ def automation_overview() -> dict[str, Any]:
         job = latest_queue.get(item["id"])
         combined = {**item, "job": job}
         automation_status = item.get("automation_status") or "not_started"
-        if automation_status == "human_action_required" or (job and job["status"] == "attention"):
+        if automation_status in {"human_action_required", "manual_review"} or (job and job["status"] == "attention"):
             groups["attention"].append(combined)
         elif job and job["status"] == "running":
             groups["running"].append(combined)
@@ -397,6 +403,7 @@ def automation_overview() -> dict[str, Any]:
             "online": setting("browser_worker_state") == "online" and heartbeat_fresh,
             "heartbeat": heartbeat,
             "detail": setting("browser_worker_detail") or "",
+            "state": setting("browser_worker_state") or "offline",
         },
         "activity": [dict(row) for row in queue_rows],
         "groups": groups,
@@ -716,6 +723,86 @@ def automation_center(request: Request):
     })
 
 
+@app.post("/automation/worker/{action}")
+def control_automation_worker(action: str):
+    if action not in {"start", "stop", "restart"}:
+        raise HTTPException(400, "Unsupported worker action")
+    if _worker_control is None:
+        raise HTTPException(503, "Worker controls are unavailable in this runtime")
+    result = _worker_control(action)
+    audit("browser_worker_control", f"Browser worker {action} requested: {result.get('state', 'unknown')}")
+    return RedirectResponse("/automation", status_code=303)
+
+
+def requeue_automation_request(request_id: int, *, allow_terminal: bool = False) -> str:
+    """Schedule another attempt while retaining the immutable transaction history."""
+    with db() as conn:
+        request_row = conn.execute(
+            "SELECT broker_name FROM requests WHERE id=?", (request_id,)
+        ).fetchone()
+        if not request_row:
+            raise HTTPException(404, "Removal request not found")
+        active = conn.execute(
+            "SELECT id FROM runner_queue WHERE request_id=? AND status IN ('queued','running') LIMIT 1",
+            (request_id,),
+        ).fetchone()
+        if active:
+            return "already_active"
+        queue_row = conn.execute(
+            "SELECT id,status FROM runner_queue WHERE request_id=? ORDER BY id DESC LIMIT 1", (request_id,)
+        ).fetchone()
+        allowed = {"attention", "failed"} | ({"completed", "cancelled"} if allow_terminal else set())
+        if queue_row and queue_row["status"] not in allowed:
+            raise HTTPException(409, "This work cannot be rerun from its current state")
+        now = utcnow()
+        if queue_row:
+            conn.execute(
+                """UPDATE runner_queue SET status='queued',stage='scheduled',created_at=?,run_after=?,reason=?,
+                attempts=0,worker_id=NULL,started_at=NULL,heartbeat_at=NULL,finished_at=NULL,last_error=''
+                WHERE id=?""",
+                (now, now, "Explicit operator rerun", queue_row["id"]),
+            )
+        else:
+            conn.execute(
+                """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason)
+                VALUES(?,?,?,'queued','Explicit operator run')""", (request_id, now, now),
+            )
+        conn.execute("UPDATE requests SET automation_status='queued' WHERE id=?", (request_id,))
+    record_submission_transaction(
+        request_id, "tracking", "started", detail="Operator scheduled a new automation attempt", automated=False
+    )
+    return "queued"
+
+
+@app.post("/automation/bulk")
+def bulk_automation_action(action: str = Form(...), request_ids: list[int] = Form(default=[])):
+    if action not in {"run", "manual"}:
+        raise HTTPException(400, "Unsupported bulk action")
+    if not request_ids:
+        raise HTTPException(400, "Select at least one item")
+    changed = 0
+    for request_id in sorted(set(request_ids))[:200]:
+        if action == "run":
+            if requeue_automation_request(request_id, allow_terminal=True) == "queued":
+                changed += 1
+        else:
+            with db() as conn:
+                running = conn.execute(
+                    "SELECT 1 FROM runner_queue WHERE request_id=? AND status='running'", (request_id,)
+                ).fetchone()
+                if running:
+                    continue
+                conn.execute("UPDATE requests SET automation_status='manual_review' WHERE id=?", (request_id,))
+                conn.execute(
+                    """UPDATE runner_queue SET status='attention',stage='manual_review',
+                    last_error='Marked for manual handling',finished_at=?
+                    WHERE request_id=? AND status='queued'""", (utcnow(), request_id),
+                )
+                changed += 1
+    audit("automation_bulk_action", f"{action} applied to {changed} selected request(s)")
+    return RedirectResponse("/automation", status_code=303)
+
+
 @app.post("/automation/policy")
 def update_automation_policy(policy: str = Form(...)):
     if policy not in AUTHORIZATION_POLICIES:
@@ -746,28 +833,8 @@ def update_broker_authorization(broker_slug: str, authorized: bool = Form(False)
 @app.post("/automation/request/{request_id}/retry")
 def retry_automation_request(request_id: int):
     """Requeue a reviewed failure without creating a duplicate submission row."""
-    with db() as conn:
-        request_row = conn.execute(
-            "SELECT broker_name FROM requests WHERE id=?", (request_id,)
-        ).fetchone()
-        if not request_row:
-            raise HTTPException(404, "Removal request not found")
-        queue_row = conn.execute(
-            """SELECT id,status FROM runner_queue WHERE request_id=?
-            ORDER BY id DESC LIMIT 1""", (request_id,)
-        ).fetchone()
-        if not queue_row or queue_row["status"] not in {"attention", "failed"}:
-            raise HTTPException(409, "Only paused or failed work can be retried")
-        now = utcnow()
-        conn.execute(
-            """UPDATE runner_queue SET status='queued',stage='scheduled',run_after=?,
-            worker_id=NULL,started_at=NULL,heartbeat_at=NULL,finished_at=NULL,last_error=''
-            WHERE id=?""", (now, queue_row["id"]),
-        )
-        conn.execute(
-            "UPDATE requests SET automation_status='queued' WHERE id=?", (request_id,)
-        )
-    audit("automation_retried", f"{request_row['broker_name']} requeued after review")
+    result = requeue_automation_request(request_id)
+    audit("automation_retried", f"Request {request_id} requeued after review: {result}")
     return RedirectResponse("/automation", status_code=303)
 
 

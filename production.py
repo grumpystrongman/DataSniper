@@ -33,7 +33,7 @@ from app import (
     DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, decrypt, encrypt,
     get_identity_variants, profile, queue_eligible_requests, refresh_due_statuses,
     setting, sync_catalog_plan, utcnow, record_submission_transaction,
-    store_automation_evidence,
+    store_automation_evidence, register_worker_control,
 )
 from automation import adapter_for
 from automation import classify_mail, message_fingerprint
@@ -717,15 +717,34 @@ def monitor_loop() -> None:
         time.sleep(6 * 60 * 60)
 
 
+browser_worker_supervisor = None
+
+
+def control_browser_worker(action: str) -> dict[str, str]:
+    if browser_worker_supervisor is None:
+        return {"state": "unavailable", "detail": "Browser worker supervisor is not initialized"}
+    return getattr(browser_worker_supervisor, action)()
+
+
+register_worker_control(control_browser_worker)
+
+
 @app.on_event("startup")
 def start_production_services() -> None:
+    global browser_worker_supervisor
     if not load_admin():
         audit("security_setup_needed", "Administrator password has not been configured")
     threading.Thread(target=monitor_loop, daemon=True, name="datasniper-monitor").start()
+    from browser_worker import BrowserWorker, WorkerSupervisor
+    browser_worker_supervisor = WorkerSupervisor(lambda: BrowserWorker(
+        db, profile, get_identity_variants, setting, record_submission_transaction,
+        store_automation_evidence, audit,
+    ))
     if os.environ.get("DATASNIPER_BROWSER_WORKER", "1") == "1":
-        from browser_worker import BrowserWorker
-        worker = BrowserWorker(
-            db, profile, get_identity_variants, setting, record_submission_transaction,
-            store_automation_evidence, audit,
-        )
-        threading.Thread(target=worker.run_forever, daemon=True, name="datasniper-browser-worker").start()
+        browser_worker_supervisor.start()
+
+
+@app.on_event("shutdown")
+def stop_production_services() -> None:
+    if browser_worker_supervisor is not None:
+        browser_worker_supervisor.shutdown()
