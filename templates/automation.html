@@ -44,6 +44,11 @@
 <div class="card" id="work-queues">
   <h2>Work queues — Broker automation matrix</h2>
   <p class="muted">Filter by the next action, select the visible items, then run automation or move them to your manual queue.</p>
+  {% if request.query_params.get('bulk_error') %}
+  <div class="notice" id="selection-error" role="alert" tabindex="-1">{{ request.query_params.get('bulk_error') }}</div>
+  {% else %}
+  <div class="notice" id="selection-error" role="alert" tabindex="-1" hidden>Select at least one item before applying an action.</div>
+  {% endif %}
   <div class="filter-bar" aria-label="Filter automation work">
     <button type="button" class="secondary filter-button active" data-filter="all">All (<span data-count="all">{{ overview["items"]|length }}</span>)</button>
     {% for key in ['attention','running','ready','waiting','failed','completed','not_started'] %}
@@ -54,6 +59,11 @@
   {% set meta = group_labels[key] %}
   <details data-group="{{ key }}" {% if key in ['attention','running','ready'] and overview.groups[key] %}open{% endif %}>
     <summary><strong>{{ meta[0] }}</strong> <span class="status">{{ overview.group_counts[key] }}</span><br><span class="muted">{{ meta[1] }}</span></summary>
+    {% if overview.groups[key] %}
+    <div class="actions" style="margin:12px 0">
+      <button class="secondary select-group" type="button" data-select-group="{{ key }}">Select all in {{ meta[0] }}</button>
+    </div>
+    {% endif %}
     {% for item in overview.groups[key] %}
   <div class="task-row"><input class="item-check" form="bulk-form" type="checkbox" name="request_ids" value="{{ item.id }}" aria-label="Select {{ item.broker_name }}">
     <div class="details"><strong>{{ item.broker_name }}</strong><br>
@@ -84,7 +94,9 @@
       <option value="manual">Move to my manual work</option>
     </select>
     <button type="submit">Apply to selected</button>
-    <button class="secondary" type="button" id="select-visible">Select visible</button>
+    <button class="secondary" type="button" id="select-all">Select all items</button>
+    <button class="secondary" type="button" id="select-visible">Select visible group</button>
+    <button class="secondary" type="button" id="clear-selection">Clear selection</button>
     <span class="muted">Reruns keep prior transaction history and create a new audited attempt.</span>
   </form>
 </div>
@@ -114,15 +126,33 @@
 <script>
 (() => {
   const groups=[...document.querySelectorAll('details[data-group]')];
+  const checks=[...document.querySelectorAll('.item-check')];
   const visibleChecks=()=>[...document.querySelectorAll('.item-check')].filter(el=>el.closest('details').style.display!=='none');
-  const update=()=>document.querySelector('#selected-count').textContent=document.querySelectorAll('.item-check:checked').length;
+  const selectionError=document.querySelector('#selection-error');
+  const update=()=>{
+    document.querySelector('#selected-count').textContent=document.querySelectorAll('.item-check:checked').length;
+    if(document.querySelector('.item-check:checked'))selectionError.hidden=true;
+  };
   document.querySelectorAll('.filter-button').forEach(button=>button.addEventListener('click',()=>{
     document.querySelectorAll('.filter-button').forEach(item=>item.classList.remove('active'));
     button.classList.add('active');
     groups.forEach(group=>{group.style.display=button.dataset.filter==='all'||group.dataset.group===button.dataset.filter?'':'none'});
   }));
-  document.querySelectorAll('.item-check').forEach(check=>check.addEventListener('change',update));
+  checks.forEach(check=>check.addEventListener('change',update));
+  document.querySelector('#select-all').addEventListener('click',()=>{checks.forEach(check=>check.checked=true);update()});
   document.querySelector('#select-visible').addEventListener('click',()=>{visibleChecks().forEach(check=>check.checked=true);update()});
+  document.querySelector('#clear-selection').addEventListener('click',()=>{checks.forEach(check=>check.checked=false);update()});
+  document.querySelectorAll('.select-group').forEach(button=>button.addEventListener('click',()=>{
+    document.querySelectorAll(`details[data-group="${button.dataset.selectGroup}"] .item-check`).forEach(check=>check.checked=true);
+    update();
+  }));
+  document.querySelector('#bulk-form').addEventListener('submit',event=>{
+    if(!document.querySelector('.item-check:checked')){
+      event.preventDefault();
+      selectionError.hidden=false;
+      selectionError.focus();
+    }
+  });
   const health=document.querySelector('#worker-health');
   const state=document.querySelector('#worker-state');
   const checked=document.querySelector('#worker-checked');

@@ -797,7 +797,8 @@ def bulk_automation_action(action: str = Form(...), request_ids: list[int] = For
     if action not in {"run", "manual"}:
         raise HTTPException(400, "Unsupported bulk action")
     if not request_ids:
-        raise HTTPException(400, "Select at least one item")
+        query = urlencode({"bulk_error": "Select at least one item before applying an action."})
+        return RedirectResponse(f"/automation?{query}#work-queues", status_code=303)
     changed = 0
     for request_id in sorted(set(request_ids))[:200]:
         if action == "run":
