@@ -404,6 +404,7 @@ def automation_overview() -> dict[str, Any]:
             "heartbeat": heartbeat,
             "detail": setting("browser_worker_detail") or "",
             "state": setting("browser_worker_state") or "offline",
+            "transition_at": setting("browser_worker_transition_at") or "",
         },
         "activity": [dict(row) for row in queue_rows],
         "groups": groups,
@@ -732,6 +733,7 @@ def automation_status() -> dict[str, Any]:
         "queue": overview["queue"],
         "running": overview["running"],
         "group_counts": overview["group_counts"],
+        "activity": overview["activity"][:25],
         "checked_at": utcnow(),
     }
 
@@ -819,7 +821,18 @@ def bulk_automation_action(action: str = Form(...), request_ids: list[int] = For
                 )
                 changed += 1
     audit("automation_bulk_action", f"{action} applied to {changed} selected request(s)")
-    return RedirectResponse("/automation", status_code=303)
+    if action == "run" and changed:
+        worker = _worker_control("wake") if _worker_control else {
+            "state": "unavailable", "detail": "Worker controls are unavailable in this runtime"
+        }
+        query = urlencode({
+            "run_count": changed,
+            "control_state": worker.get("state", "unknown"),
+            "control_detail": worker.get("detail", ""),
+        })
+        return RedirectResponse(f"/automation?{query}#live-execution", status_code=303)
+    query = urlencode({"bulk_error": "The selected items are already queued or running; no duplicate attempts were created."}) if action == "run" else ""
+    return RedirectResponse(f"/automation?{query}#work-queues" if query else "/automation#work-queues", status_code=303)
 
 
 @app.post("/automation/policy")
