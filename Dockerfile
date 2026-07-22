@@ -10,6 +10,7 @@ RUN useradd --create-home --uid 10001 datasniper
 WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+RUN playwright install --with-deps chromium
 COPY . .
 RUN mkdir -p /app/data && chown -R datasniper:datasniper /app
 USER datasniper

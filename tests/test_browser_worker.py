@@ -1,0 +1,90 @@
+from datetime import datetime, timedelta, timezone
+
+import app
+from browser_worker import BrowserResult, BrowserWorker, QueueStore
+
+
+class FakeExecutor:
+    def __init__(self, result=None, error=None):
+        self.result = result or BrowserResult("submitted", "confirmation", "Broker accepted the request", "https://example.test/done", 90)
+        self.error = error
+        self.closed = False
+
+    def run(self, job, profile, variants, policy, progress):
+        progress("browser_launched")
+        progress("inspecting_form")
+        if self.error:
+            raise self.error
+        return self.result
+
+    def close(self):
+        self.closed = True
+
+
+def configured_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(app, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(app, "DB_PATH", tmp_path / "test.db")
+    monkeypatch.setattr(app, "KEY_PATH", tmp_path / ".key")
+    monkeypatch.setattr(app, "EVIDENCE_DIR", tmp_path / "evidence")
+    app.init_db()
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute("INSERT INTO profile(id,full_name,email,phone,address,city,state,postal_code,birth_year,helper_name,created_at,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?)",
+                     tuple(app.encrypt(value) for value in ("Test Person","test@example.com","5551234567","1 Main St","Town","CA","90210","1980","")) + (now, now))
+        conn.execute("INSERT INTO requests(broker_slug,broker_name,url,status,prepared_at,automation_status) VALUES('worker-test','Worker Test','https://example.test/privacy','prepared',?,'queued')", (now,))
+        request_id = conn.execute("SELECT id FROM requests WHERE broker_slug='worker-test'").fetchone()[0]
+        conn.execute("INSERT INTO broker_automation(broker_slug,adapter_version,support_level,health_status,authorized) VALUES('worker-test',1,'full','healthy',1)")
+        conn.execute("INSERT INTO runner_queue(request_id,created_at,run_after,status,reason) VALUES(?,?,?,'queued','test')", (request_id, now, now))
+        conn.execute("UPDATE settings SET value='automatic' WHERE key='authorization_policy'")
+    return request_id
+
+
+def make_worker(executor):
+    return BrowserWorker(app.db, app.profile, app.get_identity_variants, app.setting,
+                         app.record_submission_transaction, lambda *args: None, app.audit, executor)
+
+
+def test_worker_claims_runs_and_records_live_timestamps(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    assert make_worker(FakeExecutor()).run_once() is True
+    with app.db() as conn:
+        queue = conn.execute("SELECT * FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+        request = conn.execute("SELECT automation_status FROM requests WHERE id=?", (request_id,)).fetchone()
+        transactions = conn.execute("SELECT outcome FROM submission_transactions WHERE request_id=? ORDER BY id", (request_id,)).fetchall()
+    assert queue["status"] == "completed"
+    assert queue["started_at"] and queue["heartbeat_at"] and queue["finished_at"]
+    assert queue["stage"] == "confirmation"
+    assert request["automation_status"] == "awaiting_response"
+    assert [row["outcome"] for row in transactions] == ["started", "submitted"]
+
+
+def test_worker_records_actionable_failure(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    assert make_worker(FakeExecutor(error=RuntimeError("browser executable missing"))).run_once()
+    with app.db() as conn:
+        queue = conn.execute("SELECT status,last_error FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+    assert queue["status"] == "failed"
+    assert "browser executable missing" in queue["last_error"]
+
+
+def test_stale_running_job_is_recovered(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    stale = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='running',started_at=?,heartbeat_at=?,worker_id='dead'", (stale, stale))
+    assert QueueStore(app.db, "new").recover_stale() == 1
+    with app.db() as conn:
+        row = conn.execute("SELECT status,last_error FROM runner_queue").fetchone()
+    assert row["status"] == "queued"
+    assert "stopped" in row["last_error"]
+
+
+def test_worker_heartbeat_is_real_not_configuration_flag(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    monkeypatch.setenv("DATASNIPER_BROWSER_WORKER", "1")
+    assert app.automation_overview()["worker"]["online"] is False
+    store = QueueStore(app.db, "heartbeat-test")
+    store.worker_status("online")
+    worker = app.automation_overview()["worker"]
+    assert worker["online"] is True
+    assert worker["heartbeat"]
