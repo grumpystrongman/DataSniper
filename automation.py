@@ -81,7 +81,11 @@ def adapter_for(slug: str, url: str = "") -> Adapter:
     if slug in ADAPTERS:
         return ADAPTERS[slug]
     host = (urlsplit(url).hostname or "").lower().removeprefix("www.")
-    return _adapter(slug, "assisted", (host,) if host else tuple())
+    # Registry workflows are official privacy-request forms selected explicitly
+    # by the owner. They may submit automatically only after the normal field,
+    # consent, CAPTCHA, domain and authorization checks pass.
+    level = "full" if slug.startswith("registry-") else "assisted"
+    return _adapter(slug, level, (host,) if host else tuple(), minimum_match=0)
 
 
 def normalize(value: str) -> str:
@@ -118,9 +122,10 @@ def may_submit(policy: str, score: int, strong_identifier: bool, adapter: Adapte
         return False, "adapter_requires_assistance"
     if not authorized:
         return False, "authorization_required"
-    if not strong_identifier or score < adapter.minimum_match:
+    registry_request = adapter.slug.startswith("registry-")
+    if (not registry_request and not strong_identifier) or score < adapter.minimum_match:
         return False, "match_needs_review"
-    if policy == "ask":
+    if policy == "ask" and not registry_request:
         return False, "approval_required"
     return True, "authorized"
 
@@ -170,4 +175,3 @@ def support_score(level: str, healthy: bool, verified: bool) -> int:
     if not verified:
         base = min(base, 40)
     return base
-
