@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 import app
-from browser_worker import BrowserResult, BrowserWorker, QueueStore, WorkerSupervisor, _FORM_SCRIPT, form_profile
+from browser_worker import BrowserResult, BrowserWorker, PlaywrightExecutor, QueueStore, WorkerSupervisor, _FORM_SCRIPT, form_profile
 
 
 class FakeExecutor:
@@ -53,6 +53,43 @@ def test_form_diagnostics_initializes_selected_choices_before_reading_them():
     declaration = _FORM_SCRIPT.index("let selected=[];")
     first_read = _FORM_SCRIPT.index("diagnostics.attempted.selected_choices=[...selected];")
     assert declaration < first_read
+
+
+def test_form_inspection_discovers_privacy_controls_and_embedded_forms():
+    assert "privacy request|consumer request|data request" in _FORM_SCRIPT
+    assert "target.origin===location.origin" in _FORM_SCRIPT
+    assert "datasniperFollowed" in _FORM_SCRIPT
+    source = PlaywrightExecutor.run.__code__.co_consts
+    assert any("embedded_frame_url" in value for value in source if isinstance(value, str))
+
+
+def test_body_text_uses_first_body_match():
+    class Locator:
+        def __init__(self):
+            self.first = self
+
+        def inner_text(self, timeout):
+            assert timeout == 15_000
+            return "body text"
+
+    class Page:
+        def locator(self, selector):
+            assert selector == "body"
+            return Locator()
+
+    assert PlaywrightExecutor._body_text(Page(), 4) == "body"
+
+
+def test_oversized_full_page_capture_falls_back_to_viewport():
+    calls = []
+
+    class Page:
+        def screenshot(self, *, full_page):
+            calls.append(full_page)
+            return b"x" * (5 * 1024 * 1024 + 1) if full_page else b"viewport"
+
+    assert PlaywrightExecutor._screenshot(Page()) == b"viewport"
+    assert calls == [True, False]
 
 
 def test_worker_claims_runs_and_records_live_timestamps(tmp_path, monkeypatch):
@@ -162,6 +199,72 @@ def test_failure_report_groups_similar_reasons_and_downloads_markdown(tmp_path, 
     assert "attachment; filename=" in response.headers["content-disposition"]
     assert "**2 occurrence(s) · inspection**" in report
     assert "## Worker Test — diagnostic" in report
+
+
+def test_failure_report_defaults_to_most_recent_operator_run(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        queue_id = conn.execute("SELECT id FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()[0]
+        conn.execute("UPDATE runner_queue SET batch_id='older-run' WHERE id=?", (queue_id,))
+    app.record_failure_diagnostic(request_id, queue_id, "navigation", "failed", "old failure", "", {})
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute(
+            "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason,batch_id) VALUES(?,?,?,'failed','new','latest-run')",
+            (request_id, now, now),
+        )
+        latest_queue = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    app.record_failure_diagnostic(request_id, latest_queue, "inspection", "needs_review", "latest failure", "", {})
+    assert [row["reason"] for row in app.get_failure_diagnostics()] == ["latest failure"]
+    assert {row["reason"] for row in app.get_failure_diagnostics(scope="all")} == {"old failure", "latest failure"}
+    report = app.export_failure_report().body.decode()
+    assert "Scope: most recent run" in report
+    assert "latest failure" in report
+    assert "old failure" not in report
+
+
+def test_clear_older_failures_preserves_latest_run(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    now = app.utcnow()
+    with app.db() as conn:
+        first = conn.execute("SELECT id FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()[0]
+        conn.execute("UPDATE runner_queue SET batch_id='old' WHERE id=?", (first,))
+        conn.execute(
+            "INSERT INTO runner_queue(request_id,created_at,run_after,status,reason,batch_id) VALUES(?,?,?,'failed','new','latest')",
+            (request_id, now, now),
+        )
+        second = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+    app.record_failure_diagnostic(request_id, first, "tracking", "failed", "old", "", {})
+    app.record_failure_diagnostic(request_id, second, "tracking", "failed", "latest", "", {})
+    response = app.clear_failure_diagnostics("older")
+    assert response.status_code == 303
+    assert [row["reason"] for row in app.get_failure_diagnostics(scope="all")] == ["latest"]
+
+
+def test_repeated_unresolved_url_is_archived_as_not_found(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET attempts=2 WHERE request_id=?", (request_id,))
+    worker = make_worker(FakeExecutor(error=RuntimeError("Page.goto: net::ERR_NAME_NOT_RESOLVED")))
+    assert worker.run_once()
+    with app.db() as conn:
+        queue = conn.execute("SELECT status,stage,last_error FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+        request = conn.execute("SELECT status,automation_status FROM requests WHERE id=?", (request_id,)).fetchone()
+    assert (queue["status"], queue["stage"]) == ("cancelled", "archived")
+    assert "Archived:" in queue["last_error"]
+    assert (request["status"], request["automation_status"]) == ("not_found", "not_applicable")
+
+
+def test_operator_can_archive_an_unmanageable_failure(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    response = app.bulk_automation_action("archive_unmanageable", [request_id])
+    assert response.status_code == 303
+    with app.db() as conn:
+        request = conn.execute("SELECT status,automation_status FROM requests WHERE id=?", (request_id,)).fetchone()
+        queue = conn.execute("SELECT status,stage,last_error FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+    assert (request["status"], request["automation_status"]) == ("archived", "not_applicable")
+    assert (queue["status"], queue["stage"]) == ("cancelled", "archived")
+    assert "no supported automatic or manual resolution" in queue["last_error"]
 
 
 def test_stale_running_job_is_recovered(tmp_path, monkeypatch):
