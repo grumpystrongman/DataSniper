@@ -247,3 +247,24 @@ def test_automation_page_puts_operational_filters_next_to_controls(tmp_path, mon
     assert 'data-filter="ready"' in html
     assert 'data-filter="failed"' in html
     assert "fetch('/automation/status'" in html
+    assert 'id="select-all"' in html
+    assert 'id="select-visible"' in html
+    assert 'class="secondary select-group"' in html
+    assert "Select all in Ready and queued" in html
+    assert "if(!document.querySelector('.item-check:checked'))" in html
+
+
+def test_empty_bulk_action_returns_to_work_queue_with_guidance(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    from fastapi.testclient import TestClient
+
+    client = TestClient(app.app, base_url="http://localhost")
+    response = client.post("/automation/bulk", data={"action": "run"}, follow_redirects=False)
+    assert response.status_code == 303
+    assert response.headers["location"].startswith("/automation?bulk_error=")
+    assert response.headers["location"].endswith("#work-queues")
+
+    page = client.get(response.headers["location"])
+    assert page.status_code == 200
+    assert "Select at least one item before applying an action." in page.text
+    assert 'id="selection-error"' in page.text
