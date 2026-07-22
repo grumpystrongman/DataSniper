@@ -285,6 +285,33 @@ def test_automation_controls_and_runner_queue(tmp_path):
     assert overview["full"] > 0
 
 
+def test_automation_page_renders_broker_matrix(tmp_path):
+    app, _ = configure(tmp_path)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute(
+            """INSERT INTO profile
+            (id,full_name,email,phone,address,city,state,postal_code,birth_year,helper_name,created_at,updated_at)
+            VALUES(1,?,?,?,?,?,?,?,?,?,?,?)""",
+            (app.encrypt("Test Person"), app.encrypt("test@example.com"), "", "", "", "VA", "", "", "", now, now),
+        )
+    app.build_plan("VA")
+
+    from starlette.requests import Request
+
+    request = Request({
+        "type": "http", "method": "GET", "path": "/automation",
+        "headers": [], "query_string": b"", "server": ("testserver", 80),
+        "client": ("testclient", 50000), "scheme": "http", "root_path": "",
+        "http_version": "1.1",
+    })
+    response = app.automation_center(request)
+
+    assert response.status_code == 200
+    assert b"Broker automation matrix" in response.body
+    assert b"Authorize auto-submit" in response.body
+
+
 def test_mail_receipt_schema_deduplicates_fingerprints(tmp_path):
     app, _ = configure(tmp_path)
     with app.db() as conn:
