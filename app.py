@@ -11,7 +11,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlsplit
+from urllib.parse import urlencode, urlsplit
 
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -730,8 +730,13 @@ def control_automation_worker(action: str):
     if _worker_control is None:
         raise HTTPException(503, "Worker controls are unavailable in this runtime")
     result = _worker_control(action)
+    state = str(result.get("state", "unknown"))
+    detail = str(result.get("detail", ""))[:500]
+    if state == "unavailable":
+        raise HTTPException(503, detail or "Worker controls are unavailable in this runtime")
     audit("browser_worker_control", f"Browser worker {action} requested: {result.get('state', 'unknown')}")
-    return RedirectResponse("/automation", status_code=303)
+    query = urlencode({"control_action": action, "control_state": state, "control_detail": detail})
+    return RedirectResponse(f"/automation?{query}", status_code=303)
 
 
 def requeue_automation_request(request_id: int, *, allow_terminal: bool = False) -> str:

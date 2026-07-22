@@ -173,3 +173,49 @@ def test_worker_supervisor_restarts_without_parallel_workers():
     assert len(workers) == 2
     assert supervisor._thread and supervisor._thread.is_alive()
     supervisor.shutdown()
+
+
+def test_worker_control_posts_through_production_and_reports_result(tmp_path, monkeypatch):
+    """Regression: rendered controls must cause an observable production HTTP state change."""
+    from fastapi.testclient import TestClient
+    import production
+
+    configured_db(tmp_path, monkeypatch)
+
+    class Supervisor:
+        def __init__(self):
+            self.actions = []
+
+        def start(self):
+            self.actions.append("start")
+            return {"state": "starting", "detail": "Browser worker is starting"}
+
+        def stop(self):
+            self.actions.append("stop")
+            return {"state": "stopping", "detail": "Worker will stop safely"}
+
+        def restart(self):
+            self.actions.append("restart")
+            return {"state": "restarting", "detail": "Worker will restart"}
+
+    supervisor = Supervisor()
+    monkeypatch.setattr(production, "browser_worker_supervisor", supervisor)
+    client = TestClient(production.app, base_url="http://localhost")
+
+    for action, state in (("start", "starting"), ("restart", "restarting"), ("stop", "stopping")):
+        response = client.post(f"/automation/worker/{action}", follow_redirects=True)
+        assert response.status_code == 200
+        assert supervisor.actions[-1] == action
+        assert f"{action.title()} request received:" in response.text
+        assert state in response.text
+
+
+def test_worker_control_rejects_uninitialized_runtime(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    import production
+
+    configured_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(production, "browser_worker_supervisor", None)
+    response = TestClient(production.app, base_url="http://localhost").post("/automation/worker/start")
+    assert response.status_code == 503
+    assert "not initialized" in response.text
