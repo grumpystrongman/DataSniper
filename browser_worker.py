@@ -267,6 +267,7 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     detected:{captcha},
     attempted:{filled_fields:[],selected_choices:[],submit_authorized:!!submit},
   };
+  let selected=[];
   for(const [field,names] of Object.entries(aliases)) {
     if(!profile[field]) continue;
     const el=controls.find(e=>!['checkbox','radio','file','submit','button'].includes(e.type)&&names.some(n=>describe(e).includes(n)));
@@ -277,8 +278,6 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     }
   }
   diagnostics.attempted.filled_fields=[...filled];
-  diagnostics.attempted.selected_choices=[...selected];
-  let selected=[];
   const deletion=/delete|deletion|erase|erasure|remove my (personal )?(data|information)|do not sell|opt.?out/;
   const dangerous=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear/;
   for(const el of controls.filter(e=>e.type==='radio'&&!e.checked)){
@@ -288,6 +287,7 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     const context=describe(el);if(!/request|right|action|privacy/.test(context))continue;
     const option=[...el.options].find(o=>deletion.test(o.text.toLowerCase())&&!dangerous.test(o.text.toLowerCase()));if(option){setValue(el,option.value);selected.push('deletion request');}
   }
+  diagnostics.attempted.selected_choices=[...selected];
   const risky=controls.filter(e=>['checkbox','radio','file'].includes(e.type)&&e.required&&!e.checked);
   const missing=controls.filter(e=>e.required&&!e.value&&!e.checked&&!['checkbox','radio','file'].includes(e.type));
   const summary=`Filled ${filled.length} profile field(s)${selected.length?` and selected ${selected.join(', ')}`:''}`;
