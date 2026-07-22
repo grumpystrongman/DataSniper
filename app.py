@@ -253,6 +253,7 @@ def init_db() -> None:
                 run_after TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'queued',
                 reason TEXT NOT NULL,
+                batch_id TEXT,
                 priority INTEGER NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 worker_id TEXT,
@@ -288,6 +289,7 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE broker_registry ADD COLUMN {name} {definition}")
         queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runner_queue)")}
         queue_migrations = {
+            "batch_id": "TEXT",
             "priority": "INTEGER NOT NULL DEFAULT 0",
             "worker_id": "TEXT", "stage": "TEXT NOT NULL DEFAULT 'scheduled'",
             "started_at": "TEXT", "heartbeat_at": "TEXT", "finished_at": "TEXT",
@@ -315,6 +317,7 @@ def init_db() -> None:
                     run_after TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'queued',
                     reason TEXT NOT NULL,
+                    batch_id TEXT,
                     priority INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     worker_id TEXT,
@@ -325,7 +328,7 @@ def init_db() -> None:
                     last_error TEXT NOT NULL DEFAULT ''
                 );
                 INSERT INTO runner_queue_v2
-                SELECT id,request_id,created_at,run_after,status,reason,priority,attempts,
+                SELECT id,request_id,created_at,run_after,status,reason,batch_id,priority,attempts,
                        worker_id,stage,started_at,heartbeat_at,finished_at,last_error
                 FROM runner_queue;
                 DROP TABLE runner_queue;
@@ -442,11 +445,30 @@ def record_failure_diagnostic(request_id: int, queue_id: int | None, stage: str,
         )
 
 
-def get_failure_diagnostics(limit: int = 500) -> list[dict[str, Any]]:
+def get_failure_diagnostics(limit: int = 500, scope: str = "latest") -> list[dict[str, Any]]:
     with db() as conn:
+        where, params = "", []
+        if scope == "latest":
+            latest = conn.execute(
+                """SELECT q.batch_id,d.queue_id,d.id FROM failure_diagnostics d
+                LEFT JOIN runner_queue q ON q.id=d.queue_id ORDER BY d.id DESC LIMIT 1"""
+            ).fetchone()
+            if latest:
+                if latest["batch_id"]:
+                    where, params = "WHERE q.batch_id=?", [latest["batch_id"]]
+                elif latest["queue_id"]:
+                    where, params = "WHERE d.queue_id=?", [latest["queue_id"]]
+                else:
+                    # Pre-run-ID diagnostics belong to one legacy group so
+                    # their recurring patterns remain visible after upgrade.
+                    where = "WHERE d.queue_id IS NULL"
+        elif scope != "all":
+            raise ValueError("Unsupported diagnostic scope")
         rows = conn.execute(
-            """SELECT d.*,r.broker_name,r.broker_slug FROM failure_diagnostics d
-            JOIN requests r ON r.id=d.request_id ORDER BY d.id DESC LIMIT ?""", (limit,)
+            f"""SELECT d.*,r.broker_name,r.broker_slug,q.batch_id FROM failure_diagnostics d
+            JOIN requests r ON r.id=d.request_id
+            LEFT JOIN runner_queue q ON q.id=d.queue_id
+            {where} ORDER BY d.id DESC LIMIT ?""", (*params, limit)
         ).fetchall()
     result = []
     for row in rows:
@@ -869,23 +891,30 @@ def home(request: Request):
 
 @app.get("/automation", response_class=HTMLResponse)
 def automation_center(request: Request):
-    diagnostics = get_failure_diagnostics()
+    diagnostic_scope = request.query_params.get("failure_scope", "latest")
+    if diagnostic_scope not in {"latest", "all"}:
+        diagnostic_scope = "latest"
+    diagnostics = get_failure_diagnostics(scope=diagnostic_scope)
     return templates.TemplateResponse(request, "automation.html", {
         "overview": automation_overview(),
         "policy": setting("authorization_policy") or "ask",
         "mail_configured": bool(os.environ.get("DATASNIPER_IMAP_HOST", "").strip()),
         "diagnostics": diagnostics,
         "diagnostic_summary": failure_diagnostic_summary(diagnostics),
+        "diagnostic_scope": diagnostic_scope,
     })
 
 
 @app.get("/automation/failure-report", response_class=PlainTextResponse)
-def export_failure_report():
-    rows = get_failure_diagnostics()
+def export_failure_report(scope: str = "latest"):
+    if scope not in {"latest", "all"}:
+        raise HTTPException(400, "Unsupported failure-report scope")
+    rows = get_failure_diagnostics(scope=scope)
     summary = failure_diagnostic_summary(rows)
     lines = [
         "# DataSniper Automation Failure Report", "",
-        f"Generated: {utcnow()}", f"Captured failures: {len(rows)}", "",
+        f"Generated: {utcnow()}", f"Scope: {'most recent run' if scope == 'latest' else 'all retained runs'}",
+        f"Captured failures: {len(rows)}", "",
         "This report excludes entered identity values. It describes page structure, visible control labels,",
         "choices, attempted actions, and recorded blockers for troubleshooting.", "",
         "## Recurring patterns", "",
@@ -921,6 +950,34 @@ def export_failure_report():
                              headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
+@app.post("/automation/failures/clear")
+def clear_failure_diagnostics(mode: str = Form("older")):
+    if mode not in {"older", "all"}:
+        raise HTTPException(400, "Unsupported failure cleanup mode")
+    with db() as conn:
+        if mode == "all":
+            removed = conn.execute("DELETE FROM failure_diagnostics").rowcount
+        else:
+            latest = conn.execute(
+                """SELECT q.batch_id,d.queue_id,d.id FROM failure_diagnostics d
+                LEFT JOIN runner_queue q ON q.id=d.queue_id ORDER BY d.id DESC LIMIT 1"""
+            ).fetchone()
+            if not latest:
+                removed = 0
+            elif latest["batch_id"]:
+                removed = conn.execute(
+                    """DELETE FROM failure_diagnostics WHERE id NOT IN (
+                    SELECT d.id FROM failure_diagnostics d JOIN runner_queue q ON q.id=d.queue_id
+                    WHERE q.batch_id=?)""", (latest["batch_id"],)
+                ).rowcount
+            elif latest["queue_id"]:
+                removed = conn.execute("DELETE FROM failure_diagnostics WHERE queue_id<>? OR queue_id IS NULL", (latest["queue_id"],)).rowcount
+            else:
+                removed = conn.execute("DELETE FROM failure_diagnostics WHERE id<>?", (latest["id"],)).rowcount
+    audit("failure_diagnostics_cleared", f"Cleared {removed} {mode} failure diagnostic(s)")
+    return RedirectResponse("/automation?failure_scope=latest#failure-diagnostics", status_code=303)
+
+
 @app.get("/automation/status")
 def automation_status() -> dict[str, Any]:
     """Small live payload used by the operator console to verify real worker health."""
@@ -951,7 +1008,8 @@ def control_automation_worker(action: str):
     return RedirectResponse(f"/automation?{query}", status_code=303)
 
 
-def requeue_automation_request(request_id: int, *, allow_terminal: bool = False) -> str:
+def requeue_automation_request(request_id: int, *, allow_terminal: bool = False,
+                               batch_id: str | None = None) -> str:
     """Schedule another attempt while retaining the immutable transaction history."""
     with db() as conn:
         request_row = conn.execute(
@@ -974,15 +1032,16 @@ def requeue_automation_request(request_id: int, *, allow_terminal: bool = False)
         now = utcnow()
         if queue_row:
             conn.execute(
-                """UPDATE runner_queue SET status='queued',stage='scheduled',created_at=?,run_after=?,reason=?,priority=100,
-                attempts=0,worker_id=NULL,started_at=NULL,heartbeat_at=NULL,finished_at=NULL,last_error=''
+                """UPDATE runner_queue SET status='queued',stage='scheduled',created_at=?,run_after=?,reason=?,batch_id=?,priority=100,
+                worker_id=NULL,started_at=NULL,heartbeat_at=NULL,finished_at=NULL,last_error=''
                 WHERE id=?""",
-                (now, now, "Explicit operator rerun", queue_row["id"]),
+                (now, now, "Explicit operator rerun", batch_id or uuid.uuid4().hex, queue_row["id"]),
             )
         else:
             conn.execute(
-                """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason,priority)
-                VALUES(?,?,?,'queued','Explicit operator run',100)""", (request_id, now, now),
+                """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason,batch_id,priority)
+                VALUES(?,?,?,'queued','Explicit operator run',?,100)""",
+                (request_id, now, now, batch_id or uuid.uuid4().hex),
             )
         conn.execute("UPDATE requests SET automation_status='queued' WHERE id=?", (request_id,))
     record_submission_transaction(
@@ -993,17 +1052,18 @@ def requeue_automation_request(request_id: int, *, allow_terminal: bool = False)
 
 @app.post("/automation/bulk")
 def bulk_automation_action(action: str = Form(...), request_ids: list[int] = Form(default=[])):
-    if action not in {"run", "manual"}:
+    if action not in {"run", "manual", "archive_unreachable", "archive_unmanageable"}:
         raise HTTPException(400, "Unsupported bulk action")
     if not request_ids:
         query = urlencode({"bulk_error": "Select at least one item before applying an action."})
         return RedirectResponse(f"/automation?{query}#work-queues", status_code=303)
     changed = 0
+    batch_id = uuid.uuid4().hex if action == "run" else None
     for request_id in sorted(set(request_ids))[:200]:
         if action == "run":
-            if requeue_automation_request(request_id, allow_terminal=True) == "queued":
+            if requeue_automation_request(request_id, allow_terminal=True, batch_id=batch_id) == "queued":
                 changed += 1
-        else:
+        elif action == "manual":
             with db() as conn:
                 running = conn.execute(
                     "SELECT 1 FROM runner_queue WHERE request_id=? AND status='running'", (request_id,)
@@ -1017,6 +1077,33 @@ def bulk_automation_action(action: str = Form(...), request_ids: list[int] = For
                     WHERE request_id=? AND status='queued'""", (utcnow(), request_id),
                 )
                 changed += 1
+        else:
+            terminal_status = "not_found" if action == "archive_unreachable" else "archived"
+            reason = ("Archived: official URL is unavailable or retired" if action == "archive_unreachable"
+                      else "Archived: no supported automatic or manual resolution is available")
+            with db() as conn:
+                running = conn.execute(
+                    "SELECT 1 FROM runner_queue WHERE request_id=? AND status='running'", (request_id,)
+                ).fetchone()
+                if running:
+                    continue
+                conn.execute(
+                    "UPDATE requests SET status=?,automation_status='not_applicable' WHERE id=?",
+                    (terminal_status, request_id),
+                )
+                conn.execute(
+                    """UPDATE runner_queue SET status='cancelled',stage='archived',last_error=?,finished_at=?
+                    WHERE request_id=? AND status IN ('queued','attention','failed')""",
+                    (reason, utcnow(), request_id),
+                )
+                changed += 1
+            record_submission_transaction(
+                request_id, "tracking", "no_match", detail=reason, automated=False
+            )
+            with db() as conn:
+                conn.execute(
+                    "UPDATE requests SET automation_status='not_applicable' WHERE id=?", (request_id,)
+                )
     audit("automation_bulk_action", f"{action} applied to {changed} selected request(s)")
     if action == "run" and changed:
         worker = _worker_control("wake") if _worker_control else {
