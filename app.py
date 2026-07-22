@@ -138,6 +138,37 @@ def init_db() -> None:
                 note TEXT,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS exposure_findings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                provider TEXT NOT NULL,
+                account TEXT NOT NULL,
+                breach_name TEXT NOT NULL,
+                title TEXT NOT NULL,
+                breach_date TEXT,
+                data_classes TEXT NOT NULL DEFAULT '[]',
+                severity TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'new',
+                remediation TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_exposure_status
+            ON exposure_findings(status, first_seen_at DESC);
+            CREATE TABLE IF NOT EXISTS broker_registry (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source TEXT NOT NULL,
+                source_id TEXT NOT NULL,
+                legal_name TEXT NOT NULL,
+                website TEXT,
+                privacy_url TEXT,
+                review_status TEXT NOT NULL DEFAULT 'candidate',
+                first_seen_at TEXT NOT NULL,
+                last_seen_at TEXT NOT NULL,
+                raw_record TEXT NOT NULL,
+                UNIQUE(source, source_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_registry_review
+            ON broker_registry(review_status, legal_name);
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
@@ -178,6 +209,33 @@ def get_evidence(request_id: int) -> list[dict[str, Any]]:
         {**dict(row), "filename": decrypt(row["filename"]), "note": decrypt(row["note"])}
         for row in rows
     ]
+
+
+def get_exposure_findings() -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT * FROM exposure_findings
+            ORDER BY CASE status WHEN 'new' THEN 1 WHEN 'acting' THEN 2 ELSE 3 END,
+            CASE severity WHEN 'critical' THEN 1 WHEN 'high' THEN 2 WHEN 'medium' THEN 3 ELSE 4 END,
+            breach_date DESC, id DESC"""
+        ).fetchall()
+    findings = []
+    for row in rows:
+        item = dict(row)
+        item["account"] = decrypt(item["account"])
+        item["data_classes"] = json.loads(item["data_classes"] or "[]")
+        findings.append(item)
+    return findings
+
+
+def registry_summary() -> dict[str, int]:
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT review_status,COUNT(*) count FROM broker_registry GROUP BY review_status"
+        ).fetchall()
+    counts = {row["review_status"]: row["count"] for row in rows}
+    counts["total"] = sum(counts.values())
+    return counts
 
 
 def audit(event_type: str, detail: str) -> None:
@@ -264,11 +322,53 @@ def home(request: Request):
         "done": sum(r["status"] in {"removed", "not_found"} for r in requests),
         "attention": sum(r["status"] == "verification_due" for r in requests),
     }
+    exposure_findings = get_exposure_findings()
+    summary["exposures"] = sum(item["status"] in {"new", "acting"} for item in exposure_findings)
+    summary["registry"] = registry_summary()
     return templates.TemplateResponse(
         request, "dashboard.html",
         {"profile": p, "requests": requests, "next_task": next_task, "summary": summary,
-         "identity_variants": get_identity_variants()},
+         "identity_variants": get_identity_variants(), "exposure_findings": exposure_findings[:3]},
     )
+
+
+@app.get("/exposures", response_class=HTMLResponse)
+def exposures(request: Request):
+    findings = get_exposure_findings()
+    return templates.TemplateResponse(request, "exposures.html", {
+        "findings": findings,
+        "monitor_enabled": bool(os.environ.get("HIBP_API_KEY", "").strip()),
+        "last_run": setting("exposure_audit_last_run"),
+    })
+
+
+@app.post("/exposures/{finding_id}/status")
+def exposure_status(finding_id: int, status: str = Form(...)):
+    if status not in {"new", "acting", "resolved", "accepted"}:
+        raise HTTPException(400, "Unsupported finding status")
+    with db() as conn:
+        row = conn.execute("SELECT title FROM exposure_findings WHERE id=?", (finding_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Exposure finding not found")
+        conn.execute("UPDATE exposure_findings SET status=? WHERE id=?", (status, finding_id))
+    audit("exposure_updated", f"{row['title']} marked {status}")
+    return RedirectResponse("/exposures", status_code=303)
+
+
+@app.get("/coverage", response_class=HTMLResponse)
+def coverage(request: Request):
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT source,legal_name,website,privacy_url,review_status,last_seen_at
+            FROM broker_registry ORDER BY
+            CASE review_status WHEN 'new' THEN 1 WHEN 'candidate' THEN 2 WHEN 'verified' THEN 3 ELSE 4 END,
+            legal_name LIMIT 1000"""
+        ).fetchall()
+    return templates.TemplateResponse(request, "coverage.html", {
+        "brokers": [dict(row) for row in rows],
+        "summary": registry_summary(),
+        "last_run": setting("registry_audit_last_run"),
+    })
 
 
 @app.get("/welcome", response_class=HTMLResponse)
@@ -554,6 +654,7 @@ def export_data():
         "identity_variants": get_identity_variants(),
         "requests": requests,
         "evidence": {str(item["id"]): get_evidence(item["id"]) for item in requests},
+        "exposure_findings": get_exposure_findings(),
     }, indent=2).encode()
     digest = hashlib.sha256(payload).hexdigest()
     return {"sha256": digest, "data": base64.b64encode(payload).decode()}

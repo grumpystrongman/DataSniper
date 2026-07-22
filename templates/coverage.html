@@ -1,0 +1,18 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p><a href="/">← Back</a></p>
+  <h1>Broker Coverage</h1>
+  <div class="grid"><div><div class="metric">{{ summary.total }}</div><div class="muted">official entities monitored</div></div><div><div class="metric">{{ summary.new or 0 }}</div><div class="muted">new since last review</div></div><div><div class="metric">{{ summary.verified or 0 }}</div><div class="muted">registry paths verified</div></div></div>
+  <p>DataSniper audits official data-broker registries daily. A registry record is not proof that a broker holds your data; it is a company worth checking. Candidate links never become removal tasks until their free official process is verified.</p>
+  {% if last_run %}<p class="muted">Last registry audit: {{ last_run }}</p>{% endif %}
+  <form method="post" action="/coverage/check-now"><button type="submit">Refresh official registries</button></form>
+</div>
+<div class="card">
+  <h2>Registry entities</h2>
+  {% if not brokers %}<div class="notice">The first registry import has not completed yet. Run a refresh above or leave the daily agent running.</div>{% endif %}
+  {% for broker in brokers %}
+  <div class="task-row"><div class="details"><strong>{{ broker.legal_name }}</strong><br><span class="muted">{{ broker.source|title }} registry · {{ broker.review_status.replace('_',' ') }}</span></div><div>{% if broker.privacy_url %}<a class="button secondary" href="{{ broker.privacy_url }}" target="_blank" rel="noopener">Candidate privacy path</a>{% elif broker.website %}<a class="button secondary" href="{{ broker.website }}" target="_blank" rel="noopener">Website</a>{% endif %}</div></div>
+  {% endfor %}
+</div>
+{% endblock %}

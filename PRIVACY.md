@@ -12,6 +12,8 @@ Depending on what the household enters, the application may process names, addre
 
 When a user opens or completes a broker workflow, information entered into that broker's website is governed by the broker's privacy practices. DataSniper should disclose only the minimum information required for the request. Identity-document upload always requires direct user action.
 
+Optional breach monitoring sends each configured email address to the Have I Been Pwned API when `HIBP_API_KEY` is configured. This is disabled by default. Breach findings are encrypted and retained locally. Password exposure checks use the padded Pwned Passwords k-anonymity protocol: only the first five characters of a SHA-1 hash leave DataSniper, and neither the password nor full hash is retained.
+
 ## Browser companion
 
 The browser companion operates only when invoked for a privacy task. It should not collect general browsing history, advertising identifiers, page contents unrelated to the active task, or credentials. It never submits forms automatically.

@@ -109,6 +109,9 @@ Core safeguards include:
 - No-store browser responses and defensive security headers
 - Consistent SQLite recovery backups with SHA-256 checksums
 - Non-root, read-only Docker deployment with dropped capabilities
+- Daily breach monitoring with locally encrypted findings (optional HIBP API key)
+- Free padded k-anonymous password exposure checks; passwords are never stored
+- Daily broad-coverage audits of the current California registry and the Apache-2.0-licensed 2025 CPPA-derived archive published by CalMatters/The Markup
 - Human approval before submission, identification upload, attestations, appeals, or complaints
 
 Read the full [privacy statement](PRIVACY.md) and [security policy](SECURITY.md).

@@ -8,7 +8,19 @@
     <div><div class="metric">{{ summary.waiting }}</div><div class="muted">waiting on companies</div></div>
     <div><div class="metric">{{ summary.done }}</div><div class="muted">completed</div></div>
     <div><div class="metric">{{ summary.attention }}</div><div class="muted">need a recheck</div></div>
+    <div><div class="metric">{{ summary.exposures }}</div><div class="muted">active breach findings</div></div>
   </div>
+</div>
+<div class="card {% if summary.exposures %}notice{% endif %}">
+  <h2>Exposure monitor</h2>
+  {% if summary.exposures %}<p><strong>{{ summary.exposures }} finding(s) need action.</strong> DataSniper has translated the breach data into concrete next steps.</p>{% else %}<p class="muted">No active breach findings are stored. The agent checks configured accounts daily.</p>{% endif %}
+  <a class="button" href="/exposures">Open Exposure Center</a>
+</div>
+<div class="card">
+  <h2>Broker coverage</h2>
+  <p><strong>{{ summary.registry.total }}</strong> official registry entities monitored · <strong>{{ summary.total }}</strong> verified removal workflows active</p>
+  <p class="muted">Registry entries are broad surveillance coverage. Only a free official removal path that passes review becomes an actionable task.</p>
+  <a class="button secondary" href="/coverage">Review coverage</a>
 </div>
 {% if next_task %}
 <div class="card">
