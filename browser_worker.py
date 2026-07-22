@@ -7,6 +7,7 @@ at the same time.  Page text and identity values are never written to logs.
 from __future__ import annotations
 
 import os
+import re
 import socket
 import threading
 import time
@@ -145,22 +146,35 @@ class QueueStore:
             )
 
     def finish(self, job: dict[str, Any], result: BrowserResult) -> None:
-        queue_state = "completed" if result.outcome in {"submitted", "confirmed"} else (
-            "attention" if result.outcome in {"blocked", "needs_review"} else "failed"
+        permanent_url_failure = bool(re.search(r"HTTP (404|410)\b", result.detail)) or (
+            job.get("attempts", 0) + 1 >= 3
+            and bool(re.search(r"ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED", result.detail))
         )
+        queue_state = "cancelled" if permanent_url_failure else ("completed" if result.outcome in {"submitted", "confirmed"} else (
+            "attention" if result.outcome in {"blocked", "needs_review"} else "failed"
+        ))
         status = {
             "submitted": "awaiting_response", "confirmed": "completed", "blocked": "human_action_required",
             "needs_review": "human_action_required", "failed": "failed", "no_match": "not_applicable",
         }.get(result.outcome, result.outcome)
+        if permanent_url_failure:
+            status = "not_applicable"
         now = _now()
         with self.db_factory() as conn:
             conn.execute(
                 """UPDATE runner_queue SET status=?,stage=?,finished_at=?,heartbeat_at=?,last_error=?
                 WHERE id=? AND worker_id=?""",
-                (queue_state, result.stage, now, now,
-                 result.detail[:1000] if queue_state != "completed" else "", job["queue_id"], self.worker_id),
+                (queue_state, "archived" if permanent_url_failure else result.stage, now, now,
+                 (("Archived: official URL is unavailable after repeated checks — " if permanent_url_failure else "") + result.detail)[:1000]
+                 if queue_state != "completed" else "", job["queue_id"], self.worker_id),
             )
-            conn.execute("UPDATE requests SET automation_status=? WHERE id=?", (status, job["request_id"]))
+            if permanent_url_failure:
+                conn.execute(
+                    "UPDATE requests SET status='not_found',automation_status=? WHERE id=?",
+                    (status, job["request_id"]),
+                )
+            else:
+                conn.execute("UPDATE requests SET automation_status=? WHERE id=?", (status, job["request_id"]))
 
 
 class PlaywrightExecutor:
@@ -184,6 +198,19 @@ class PlaywrightExecutor:
             except Exception:
                 pass
 
+    @staticmethod
+    def _body_text(page: Any, limit: int) -> str:
+        """Read the document body without assuming custom elements contain one body."""
+        return page.locator("body").first.inner_text(timeout=15_000)[:limit]
+
+    @staticmethod
+    def _screenshot(page: Any) -> bytes:
+        """Keep diagnostic evidence within the encrypted evidence-store limit."""
+        capture = page.screenshot(full_page=True)
+        if len(capture) <= 5 * 1024 * 1024:
+            return capture
+        return page.screenshot(full_page=False)
+
     def run(self, job: dict[str, Any], profile: dict[str, str], variants: list[dict[str, Any]],
             policy: str, progress: Callable[[str], None]) -> BrowserResult:
         if not self._context:
@@ -200,42 +227,65 @@ class PlaywrightExecutor:
             if not (actual == expected or actual.endswith("." + expected)):
                 return BrowserResult("needs_review", "navigation", "The official URL redirected to an unapproved domain", page.url)
             progress("inspecting_form")
-            text = page.locator("body").inner_text(timeout=15_000)[:250_000]
+            text = self._body_text(page, 250_000)
             decision = match_identity(text, profile, variants)
             allowed, reason = may_submit(policy, decision["score"], decision["strong_identifier"], adapter, bool(job["authorized"]))
             supplied = form_profile(profile)
             result = None
             for step in range(4):
                 result = page.evaluate(_FORM_SCRIPT, {"profile": supplied, "aliases": adapter.field_aliases, "submit": allowed})
+                if result.get("detail") == "No unambiguous submission form was found":
+                    for frame in page.frames:
+                        if frame == page.main_frame:
+                            continue
+                        try:
+                            frame_result = frame.evaluate(
+                                _FORM_SCRIPT,
+                                {"profile": supplied, "aliases": adapter.field_aliases, "submit": allowed},
+                            )
+                        except Exception:
+                            continue
+                        if frame_result.get("detail") != "No unambiguous submission form was found":
+                            result = frame_result
+                            result.setdefault("diagnostics", {})["embedded_frame_url"] = frame.url[:500]
+                            break
                 result["match_score"] = decision["score"]
                 if result["outcome"] != "advanced":
                     break
                 progress(f"form_step_{step + 2}")
                 page.wait_for_timeout(1200)
+                actual = (urlsplit(page.url).hostname or "").removeprefix("www.")
+                if not (actual == expected or actual.endswith("." + expected)):
+                    result.update(
+                        outcome="needs_review",
+                        stage="navigation",
+                        detail="A privacy-request control redirected to an unapproved domain",
+                    )
+                    break
             assert result is not None
             diagnostics = result.get("diagnostics")
             if result["outcome"] in {"blocked", "needs_review", "advanced"}:
                 if result["outcome"] == "advanced":
                     result.update(outcome="needs_review", stage="inspection", detail="The form exceeded four automatic steps; review is required")
                 return BrowserResult(**{key: result[key] for key in ("outcome", "stage", "detail", "match_score")},
-                                     page_url=page.url, screenshot=page.screenshot(full_page=True),
+                                     page_url=page.url, screenshot=self._screenshot(page),
                                      diagnostics=diagnostics)
             if not allowed:
                 return BrowserResult("needs_review", "authorization", reason.replace("_", " "), page.url,
                                      decision["score"], diagnostics=diagnostics)
             progress("submitting_form")
             page.wait_for_timeout(2500)
-            confirmation = classify_confirmation_page(page.locator("body").inner_text()[:100_000], adapter)
+            confirmation = classify_confirmation_page(self._body_text(page, 100_000), adapter)
             if confirmation == "failed":
                 return BrowserResult("failed", "confirmation", "The broker page reported that submission failed", page.url,
-                                     decision["score"], screenshot=page.screenshot(full_page=True),
+                                     decision["score"], screenshot=self._screenshot(page),
                                      diagnostics=diagnostics)
             outcome = "confirmed" if confirmation in {"accepted", "completed"} else "submitted"
             detail = "Broker confirmed receipt" if confirmation == "accepted" else (
                 "Broker reported completion" if confirmation == "completed" else "Form submitted; awaiting broker response"
             )
             return BrowserResult(outcome, "confirmation", detail, page.url, decision["score"], confirmation,
-                                 page.screenshot(full_page=True), diagnostics)
+                                 self._screenshot(page), diagnostics)
         finally:
             page.close()
 
@@ -296,7 +346,22 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
   if(risky.length||missing.length)return {outcome:'needs_review',stage:'inspection',detail:`${summary}; ${risky.length+missing.length} required or legal field(s) need review`,diagnostics};
   const form=controls.find(e=>e.form)?.form||document.querySelector('form');
   const button=form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
-  if(!form||!button)return {outcome:'needs_review',stage:'inspection',detail:'No unambiguous submission form was found',diagnostics};
+  if(!form||!button){
+    const requestControl=[...document.querySelectorAll('a[href],button,[role="button"]')].find(el=>{
+      if(el.dataset?.datasniperFollowed==='1')return false;
+      const label=clean(`${el.innerText||''} ${el.getAttribute('aria-label')||''} ${el.getAttribute('href')||''}`).toLowerCase();
+      if(!/privacy request|consumer request|data request|exercise.{0,12}rights|do not sell|do not share|delete.{0,12}(data|information)|opt.?out/.test(label))return false;
+      if(el.tagName!=='A')return true;
+      try{const target=new URL(el.href,location.href);return target.origin===location.origin;}catch{return false;}
+    });
+    if(requestControl){
+      requestControl.dataset.datasniperFollowed='1';
+      diagnostics.attempted.button=clean(requestControl.innerText||requestControl.getAttribute('aria-label')||requestControl.getAttribute('href')||'privacy request');
+      requestControl.click();
+      return {outcome:'advanced',stage:'inspection',detail:'Opened a privacy-request control',diagnostics};
+    }
+    return {outcome:'needs_review',stage:'inspection',detail:'No unambiguous submission form was found',diagnostics};
+  }
   if(!submit)return {outcome:'needs_review',stage:'authorization',detail:`${summary}; submission is not authorized`,diagnostics};
   if(!form.checkValidity())return {outcome:'needs_review',stage:'inspection',detail:'The form did not pass browser validation',diagnostics};
   const buttonText=(button.innerText||button.value||'').toLowerCase();
