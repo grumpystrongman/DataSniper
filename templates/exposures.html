@@ -1,0 +1,28 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <p><a href="/">← Back</a></p>
+  <h1>Exposure Center</h1>
+  <p>DataSniper watches your primary and saved former email addresses for known breaches, deduplicates findings, and gives you the next protective action.</p>
+  {% if monitor_enabled %}
+    <div class="good"><strong>Daily breach monitoring is active.</strong>{% if last_run %} Last completed: {{ last_run }}.{% endif %}</div>
+    <form method="post" action="/exposures/check-now"><button type="submit">Check now</button></form>
+  {% else %}
+    <div class="notice"><strong>Email monitoring is not configured.</strong> Add <code>HIBP_API_KEY</code> to the DataSniper server environment. The key is never stored in the database or backup.</div>
+  {% endif %}
+</div>
+<div class="card">
+  <h2>Private password exposure check</h2>
+  <p class="muted">Your password is hashed in memory. Only the first five hash characters are sent using the padded k-anonymity protocol; the password and full hash are never stored or transmitted.</p>
+  {% if request.query_params.get('password_result') == 'exposed' %}<div class="notice"><strong>This password has appeared in known breach data {{ request.query_params.get('count') }} time(s).</strong> Stop using it, change it anywhere it was reused, and enable MFA.</div>{% elif request.query_params.get('password_result') == 'not_found' %}<div class="good"><strong>No match was found in the known-password corpus.</strong> This does not prove the password is safe; it should still be unique.</div>{% endif %}
+  <form method="post" action="/exposures/password-check"><label>Password to check</label><input type="password" name="password" required autocomplete="off"><button type="submit">Check privately</button></form>
+</div>
+<div class="card">
+  <h2>Findings</h2>
+  {% if not findings %}<p class="muted">No breach findings have been recorded.</p>{% endif %}
+  {% for item in findings %}
+  <div class="task-row"><div class="details"><strong>{{ item.title }}</strong> · {{ item.severity|title }}<br><span class="muted">{{ item.account }}{% if item.breach_date %} · Breach date {{ item.breach_date }}{% endif %}</span><p>{{ item.remediation }}</p>{% if item.data_classes %}<small>Exposed data: {{ item.data_classes|join(', ') }}</small>{% endif %}</div>
+  <form method="post" action="/exposures/{{ item.id }}/status"><select name="status"><option value="new" {% if item.status == 'new' %}selected{% endif %}>Needs action</option><option value="acting" {% if item.status == 'acting' %}selected{% endif %}>Working on it</option><option value="resolved" {% if item.status == 'resolved' %}selected{% endif %}>Resolved</option><option value="accepted" {% if item.status == 'accepted' %}selected{% endif %}>Risk accepted</option></select><button class="secondary" type="submit">Save</button></form></div>
+  {% endfor %}
+</div>
+{% endblock %}
