@@ -343,7 +343,7 @@ def automation_overview() -> dict[str, Any]:
         ).fetchall()
         queue_rows = conn.execute(
             """SELECT q.*,r.broker_name FROM runner_queue q JOIN requests r ON r.id=q.request_id
-            WHERE q.status IN ('queued','running','attention','failed') ORDER BY q.id DESC LIMIT 100"""
+            WHERE q.status IN ('queued','running','attention','failed','completed') ORDER BY q.id DESC LIMIT 200"""
         ).fetchall()
         queue = sum(row["status"] == "queued" for row in queue_rows)
     items = []
@@ -362,6 +362,28 @@ def automation_overview() -> dict[str, Any]:
             heartbeat_fresh = datetime.fromisoformat(heartbeat.replace("Z", "+00:00")) >= datetime.now().astimezone() - timedelta(seconds=30)
         except ValueError:
             pass
+    latest_queue = {}
+    for row in queue_rows:
+        latest_queue.setdefault(row["request_id"], dict(row))
+    groups = {key: [] for key in ("attention", "running", "ready", "waiting", "failed", "completed", "not_started")}
+    for item in items:
+        job = latest_queue.get(item["id"])
+        combined = {**item, "job": job}
+        automation_status = item.get("automation_status") or "not_started"
+        if automation_status == "human_action_required" or (job and job["status"] == "attention"):
+            groups["attention"].append(combined)
+        elif job and job["status"] == "running":
+            groups["running"].append(combined)
+        elif job and job["status"] == "queued":
+            groups["ready"].append(combined)
+        elif automation_status == "awaiting_response":
+            groups["waiting"].append(combined)
+        elif automation_status == "failed" or (job and job["status"] == "failed"):
+            groups["failed"].append(combined)
+        elif automation_status in {"completed", "not_applicable"} or item.get("status") in {"removed", "not_found"}:
+            groups["completed"].append(combined)
+        else:
+            groups["not_started"].append(combined)
     return {
         "items": items,
         "queue": queue,
@@ -377,6 +399,8 @@ def automation_overview() -> dict[str, Any]:
             "detail": setting("browser_worker_detail") or "",
         },
         "activity": [dict(row) for row in queue_rows],
+        "groups": groups,
+        "group_counts": {key: len(value) for key, value in groups.items()},
     }
 
 
@@ -716,6 +740,34 @@ def update_broker_authorization(broker_slug: str, authorized: bool = Form(False)
             (int(authorized), utcnow() if authorized else None, broker_slug),
         )
     audit("broker_authorization_updated", f"{broker_slug} automatic submission {'enabled' if authorized else 'disabled'}")
+    return RedirectResponse("/automation", status_code=303)
+
+
+@app.post("/automation/request/{request_id}/retry")
+def retry_automation_request(request_id: int):
+    """Requeue a reviewed failure without creating a duplicate submission row."""
+    with db() as conn:
+        request_row = conn.execute(
+            "SELECT broker_name FROM requests WHERE id=?", (request_id,)
+        ).fetchone()
+        if not request_row:
+            raise HTTPException(404, "Removal request not found")
+        queue_row = conn.execute(
+            """SELECT id,status FROM runner_queue WHERE request_id=?
+            ORDER BY id DESC LIMIT 1""", (request_id,)
+        ).fetchone()
+        if not queue_row or queue_row["status"] not in {"attention", "failed"}:
+            raise HTTPException(409, "Only paused or failed work can be retried")
+        now = utcnow()
+        conn.execute(
+            """UPDATE runner_queue SET status='queued',stage='scheduled',run_after=?,
+            worker_id=NULL,started_at=NULL,heartbeat_at=NULL,finished_at=NULL,last_error=''
+            WHERE id=?""", (now, queue_row["id"]),
+        )
+        conn.execute(
+            "UPDATE requests SET automation_status='queued' WHERE id=?", (request_id,)
+        )
+    audit("automation_retried", f"{request_row['broker_name']} requeued after review")
     return RedirectResponse("/automation", status_code=303)
 
 
