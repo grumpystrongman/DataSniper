@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import csv
 import io
+import imaplib
 import json
 import os
 import secrets
@@ -12,6 +13,8 @@ import sqlite3
 import threading
 import time
 import zipfile
+from email import policy as email_policy
+from email.parser import BytesParser
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -28,8 +31,11 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 
 from app import (
     DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, decrypt, encrypt,
-    get_identity_variants, profile, refresh_due_statuses, setting, sync_catalog_plan, utcnow,
+    get_identity_variants, profile, queue_eligible_requests, refresh_due_statuses,
+    setting, sync_catalog_plan, utcnow,
 )
+from automation import adapter_for
+from automation import classify_mail, message_fingerprint
 from broker_catalog import BROKERS, CATALOG_VERSION
 
 ROOT = Path(__file__).resolve().parent
@@ -419,6 +425,17 @@ def audit_broker_catalog(client: httpx.Client | None = None) -> dict[str, int]:
                     VALUES(?,?,?,?,?,?,?)""",
                     (broker["slug"], checked_at, status, http_status, final_url, content_hash, detail),
                 )
+                adapter = adapter_for(broker["slug"], broker["url"])
+                adapter_health = "healthy" if status == "healthy" else "broken" if status == "unavailable" else "review"
+                conn.execute(
+                    """INSERT INTO broker_automation
+                    (broker_slug,adapter_version,support_level,health_status,health_checked_at,health_detail)
+                    VALUES(?,?,?,?,?,?) ON CONFLICT(broker_slug) DO UPDATE SET
+                    adapter_version=excluded.adapter_version,support_level=excluded.support_level,
+                    health_status=excluded.health_status,health_checked_at=excluded.health_checked_at,
+                    health_detail=excluded.health_detail""",
+                    (broker["slug"], adapter.version, adapter.level, adapter_health, checked_at, detail),
+                )
             counts[status] += 1
 
         added = sync_catalog_plan()
@@ -433,6 +450,75 @@ def audit_broker_catalog(client: httpx.Client | None = None) -> dict[str, int]:
     finally:
         if own_client:
             client.close()
+
+
+def run_automation_scheduler() -> dict[str, int]:
+    """Prepare safe browser work; the extension executes it in the user's real session."""
+    queued = queue_eligible_requests()
+    with db() as conn:
+        attention = conn.execute(
+            """SELECT COUNT(*) FROM requests WHERE automation_status
+            IN ('human_action_required','failed')"""
+        ).fetchone()[0]
+        conn.execute(
+            """INSERT INTO settings(key,value) VALUES('automation_runner_last_run',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (utcnow(),)
+        )
+    audit("automation_runner", f"{queued} task(s) queued; {attention} exception(s) need attention")
+    return {"queued": queued, "attention": attention}
+
+
+def reconcile_mailbox(connection=None) -> dict[str, int | str]:
+    """Read a dedicated IMAP inbox locally; retain classifications, not bodies."""
+    host = os.environ.get("DATASNIPER_IMAP_HOST", "").strip()
+    username = os.environ.get("DATASNIPER_IMAP_USERNAME", "").strip()
+    password = os.environ.get("DATASNIPER_IMAP_PASSWORD", "").strip()
+    if not (host and username and password) and connection is None:
+        return {"status": "not_configured", "checked": 0, "matched": 0}
+    own_connection = connection is None
+    mailbox = connection or imaplib.IMAP4_SSL(host)
+    checked = matched = 0
+    try:
+        if own_connection:
+            mailbox.login(username, password)
+        mailbox.select(os.environ.get("DATASNIPER_IMAP_FOLDER", "INBOX"), readonly=True)
+        _, result = mailbox.search(None, "UNSEEN")
+        identifiers = (result[0].split() if result and result[0] else [])[-100:]
+        with db() as conn:
+            requests = [dict(row) for row in conn.execute("SELECT id,broker_slug,broker_name,url FROM requests")]
+        for identifier in identifiers:
+            status, payload = mailbox.fetch(identifier, "(RFC822)")
+            if status != "OK" or not payload or not isinstance(payload[0], tuple):
+                continue
+            message = BytesParser(policy=email_policy.default).parsebytes(payload[0][1])
+            subject, sender = str(message.get("subject", "")), str(message.get("from", ""))
+            body = message.get_body(preferencelist=("plain",))
+            text = body.get_content() if body else ""
+            fingerprint = message_fingerprint(str(message.get("message-id", identifier)), subject, sender)
+            checked += 1
+            normalized = f"{subject} {sender}".casefold()
+            request = next((item for item in requests if item["broker_name"].casefold() in normalized or item["broker_slug"].replace("-", " ") in normalized), None)
+            kind = classify_mail(subject, text)
+            with db() as conn:
+                cur = conn.execute(
+                    """INSERT OR IGNORE INTO mail_receipts
+                    (fingerprint,request_id,received_at,sender,subject,kind,action_url,processed_at)
+                    VALUES(?,?,?,?,?,?,?,?)""",
+                    (fingerprint, request["id"] if request else None, utcnow(), encrypt(sender[:500]),
+                     encrypt(subject[:1000]), kind, "", utcnow()),
+                )
+                if cur.rowcount and request:
+                    state = "denied" if kind == "denied" else "completed" if kind == "completed" else "action_required" if kind in {"verification", "more_information"} else "confirmed"
+                    conn.execute("UPDATE requests SET confirmation_status=? WHERE id=?", (state, request["id"]))
+                    matched += 1
+        audit("mailbox_reconciled", f"{checked} message(s) classified; {matched} linked to requests")
+        return {"status": "complete", "checked": checked, "matched": matched}
+    finally:
+        if own_connection:
+            try:
+                mailbox.logout()
+            except imaplib.IMAP4.error:
+                pass
 
 
 def check_saved_profiles(client: httpx.Client | None = None) -> dict[str, int]:
@@ -615,6 +701,9 @@ def monitor_loop() -> None:
                 audit_official_registries()
             if os.environ.get("DATASNIPER_EXPOSURE_AUDIT", "1") == "1" and exposure_audit_due():
                 audit_exposures()
+            if os.environ.get("DATASNIPER_AUTOMATION_RUNNER", "1") == "1":
+                run_automation_scheduler()
+                reconcile_mailbox()
             if os.environ.get("DATASNIPER_AUTOBACKUP", "1") == "1":
                 newest = max(BACKUP_DIR.glob("*.zip"), key=lambda p: p.stat().st_mtime, default=None)
                 if newest is None or time.time() - newest.stat().st_mtime > 7 * 86400:

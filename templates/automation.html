@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>Automation Center</h1>
+  <p class="muted">DataSniper runs supported privacy work and leaves only identity checks, CAPTCHAs, legal attestations, and ambiguous matches for you.</p>
+  <div class="grid">
+    <div><div class="metric">{{ overview.full }}</div><div class="muted">fully automated</div></div>
+    <div><div class="metric">{{ overview.assisted }}</div><div class="muted">assisted</div></div>
+    <div><div class="metric">{{ overview.manual }}</div><div class="muted">manual-only</div></div>
+    <div><div class="metric">{{ overview.queue }}</div><div class="muted">queued</div></div>
+    <div><div class="metric">{{ overview.attention }}</div><div class="muted">need attention</div></div>
+  </div>
+</div>
+<div class="card">
+  <h2>Authorization policy</h2>
+  <p class="muted">A broker must also be authorized below before DataSniper can submit. CAPTCHA, ID upload, consent, and legal attestations always pause.</p>
+  <form method="post" action="/automation/policy">
+    <select name="policy">
+      <option value="ask" {% if policy == 'ask' %}selected{% endif %}>Always ask before submission</option>
+      <option value="high_confidence" {% if policy == 'high_confidence' %}selected{% endif %}>Submit high-confidence matches</option>
+      <option value="automatic" {% if policy == 'automatic' %}selected{% endif %}>Run authorized supported workflows automatically</option>
+    </select>
+    <button type="submit">Save policy</button>
+  </form>
+  <p><strong>Mailbox reconciliation:</strong> {{ 'configured' if mail_configured else 'not configured' }}. Message bodies are classified locally and are not retained.</p>
+</div>
+<div class="card">
+  <h2>Broker automation matrix</h2>
+  {% for item in overview.items %}
+  <div class="task-row">
+    <div class="details"><strong>{{ item.broker_name }}</strong><br>
+      <span class="status">{{ item.support_level or 'manual' }}</span>
+      <span class="muted">score {{ item.support_score }}/100 · adapter {{ item.health_status or 'untested' }} · {{ item.automation_status.replace('_',' ') }}</span>
+      {% if item.match_score is not none %}<br><span class="muted">Last match: {{ item.match_score }}%</span>{% endif %}
+    </div>
+    <form method="post" action="/automation/{{ item.broker_slug }}/authorization">
+      <input type="hidden" name="authorized" value="{{ 'false' if item.authorized else 'true' }}">
+      <button class="{{ 'secondary' if item.authorized else '' }}" type="submit">{{ 'Disable auto-submit' if item.authorized else 'Authorize auto-submit' }}</button>
+    </form>
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

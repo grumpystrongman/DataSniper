@@ -212,3 +212,39 @@ def test_submission_transaction_rejects_unknown_state(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         app.record_submission_transaction(request_id, "bypass", "captcha_solved")
+
+
+def test_automation_controls_and_runner_queue(tmp_path):
+    app, _ = configure(tmp_path)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute(
+            """INSERT INTO profile
+            (id,full_name,email,phone,address,city,state,postal_code,birth_year,helper_name,created_at,updated_at)
+            VALUES(1,?,?,?,?,?,?,?,?,?,?,?)""",
+            (app.encrypt("Test Person"), app.encrypt("test@example.com"), "", "", "", "VA", "", "", "", now, now),
+        )
+    app.build_plan("VA")
+    assert app.queue_eligible_requests() > 0
+    overview = app.automation_overview()
+    assert overview["queue"] > 0
+    assert overview["full"] > 0
+
+
+def test_mail_receipt_schema_deduplicates_fingerprints(tmp_path):
+    app, _ = configure(tmp_path)
+    with app.db() as conn:
+        first = conn.execute(
+            """INSERT OR IGNORE INTO mail_receipts
+            (fingerprint,received_at,sender,subject,kind,processed_at)
+            VALUES('same','2026-01-01',?,?,?,?)""",
+            (app.encrypt("broker@example.com"), app.encrypt("Request received"), "accepted", app.utcnow()),
+        )
+        second = conn.execute(
+            """INSERT OR IGNORE INTO mail_receipts
+            (fingerprint,received_at,sender,subject,kind,processed_at)
+            VALUES('same','2026-01-01',?,?,?,?)""",
+            (app.encrypt("broker@example.com"), app.encrypt("Request received"), "accepted", app.utcnow()),
+        )
+    assert first.rowcount == 1
+    assert second.rowcount == 0

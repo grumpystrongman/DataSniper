@@ -6,6 +6,7 @@
   <p>{{ task.notes }}</p>
   <p><span class="status {{ task.status }}">{{ task.status.replace('_',' ') }}</span></p>
   <p><strong>Automation:</strong> {{ (task.automation_status or 'not_started').replace('_',' ') }}{% if task.match_score is not none %} · match confidence {{ task.match_score }}%{% endif %}</p>
+  {% if automation %}<p><strong>Adapter:</strong> {{ automation.support_level }} · {{ automation.health_status }} · {{ 'automatic submission authorized' if automation.authorized else 'approval required' }}</p>{% endif %}
   {% if identity_variants %}<details><summary><strong>Identity variants to check ({{ identity_variants|length }})</strong></summary><ul>{% for item in identity_variants %}<li>{{ item.kind.replace('_',' ')|title }}: {{ item.value }}{% if item.label %} — {{ item.label }}{% endif %}</li>{% endfor %}</ul></details>{% endif %}
   {% if task.status == 'prepared' %}
     <div class="notice"><strong>The agent has prepared this task.</strong> Review the broker page, complete any CAPTCHA or identity check, and submit only when you are comfortable.</div>

@@ -40,6 +40,30 @@ DataSniper turns that bureaucracy into a household workflow:
 
 > **You make the decisions. DataSniper handles the administrative work.**
 
+## Privacy autopilot
+
+DataSniper now has a local automation control plane in addition to its removal
+ledger. Versioned broker adapters score visible records against encrypted
+identity variants, fill recognized fields, enforce per-broker authorization and
+match thresholds, and verify the resulting confirmation page. Supported
+workflows can submit automatically; ambiguous matches, CAPTCHAs, ID uploads,
+consent choices, and legal attestations are placed in a human-action queue.
+
+The daily runner also health-tests adapters, applies bounded exponential retry
+windows, records every state transition, captures encrypted before/after
+evidence, reconciles a dedicated IMAP inbox, and reports an honest per-broker
+support score (`full`, `assisted`, `manual`, `captcha`, or `broken`). Mail bodies
+are classified locally and are not retained.
+
+Optional mailbox configuration:
+
+```text
+DATASNIPER_IMAP_HOST=imap.example.com
+DATASNIPER_IMAP_USERNAME=privacy@example.com
+DATASNIPER_IMAP_PASSWORD=app-password
+DATASNIPER_IMAP_FOLDER=INBOX
+```
+
 ## Why use DataSniper?
 
 ### Stop maintaining a privacy spreadsheet
