@@ -14,7 +14,7 @@
   {% endif %}
   <div id="worker-health" data-state="{{ overview.worker.state }}" class="{{ 'good' if overview.worker.online else 'notice' }}" role="status" aria-live="polite">
   {% if overview.worker.online %}
-  <strong>Background browser worker online.</strong> <span id="worker-summary">{{ overview.running }} running · {{ overview.queue }} queued</span>{% if overview.worker.heartbeat %} · heartbeat <span id="worker-heartbeat">{{ overview.worker.heartbeat }}</span>{% endif %}.
+  <strong>Background browser worker online.</strong> <span id="worker-summary">{{ overview.running }} running · {{ overview.queue_due }} ready now · {{ overview.queue_deferred }} scheduled later</span>{% if overview.worker.heartbeat %} · heartbeat <span id="worker-heartbeat">{{ overview.worker.heartbeat }}</span>{% endif %}.
   {% elif overview.worker.configured %}
   <strong>Background browser worker is offline.</strong> Queued work is not currently executing.{% if overview.worker.detail %} <span id="worker-detail">{{ overview.worker.detail }}</span>.{% else %}<span id="worker-detail"></span>{% endif %}
   {% else %}
@@ -102,6 +102,24 @@
     <button class="secondary" type="button" id="clear-selection">Clear selection</button>
     <span class="muted">Reruns keep prior transaction history and create a new audited attempt.</span>
   </form>
+</div>
+<div class="card" id="failure-diagnostics">
+  <h2>Failure diagnostics</h2>
+  <p class="muted">When automation stops, DataSniper records what the page appeared to ask for, the visible controls and choices, the attempted action, and the blocker. Entered personal values are excluded.</p>
+  <div class="actions">
+    <a class="button" href="/automation/failure-report">Export troubleshooting report</a>
+    <span class="muted">{{ diagnostics|length }} captured failure(s) · {{ diagnostic_summary|length }} recurring pattern(s)</span>
+  </div>
+  {% if diagnostic_summary %}
+  <h3>Most common patterns</h3>
+  {% for pattern in diagnostic_summary[:10] %}
+  <div class="task-row">
+    <div><strong>{{ pattern.count }}× · {{ pattern.stage.replace('_',' ') }}</strong><br>{{ pattern.reason }}<br><small class="muted">{{ pattern.brokers|join(', ') }}</small></div>
+  </div>
+  {% endfor %}
+  {% else %}
+  <p>No structured failures have been captured yet. New failed, blocked, and needs-review attempts will appear here.</p>
+  {% endif %}
 </div>
 <div class="card" id="live-execution">
   <h2>Live execution</h2>
@@ -195,7 +213,7 @@
       elapsed.textContent=data.worker.phase_age_seconds==null?'':`${data.worker.phase_age_seconds}s in this phase · `;
       health.dataset.state=data.worker.state||'unknown';
       if(data.worker.online){
-        renderHealth('Background browser worker online.',` ${data.running} running · ${data.queue} queued${data.worker.heartbeat?` · heartbeat ${data.worker.heartbeat}`:''}.`,true);
+        renderHealth('Background browser worker online.',` ${data.running} running · ${data.queue_due} ready now · ${data.queue_deferred} scheduled later${data.worker.heartbeat?` · heartbeat ${data.worker.heartbeat}`:''}.`,true);
       } else {
         renderHealth(`Background browser worker ${data.worker.state||'offline'}.`,` ${data.worker.transition_at?`Phase started ${data.worker.transition_at}. `:''}Queued work is not currently executing.${data.worker.detail?` ${data.worker.detail}.`:''}`,false);
       }

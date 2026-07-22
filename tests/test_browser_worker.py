@@ -45,7 +45,8 @@ def configured_db(tmp_path, monkeypatch):
 
 def make_worker(executor):
     return BrowserWorker(app.db, app.profile, app.get_identity_variants, app.setting,
-                         app.record_submission_transaction, lambda *args: None, app.audit, executor)
+                         app.record_submission_transaction, lambda *args: None, app.audit,
+                         app.record_failure_diagnostic, executor)
 
 
 def test_worker_claims_runs_and_records_live_timestamps(tmp_path, monkeypatch):
@@ -62,6 +63,48 @@ def test_worker_claims_runs_and_records_live_timestamps(tmp_path, monkeypatch):
     assert [row["outcome"] for row in transactions] == ["started", "submitted"]
 
 
+def test_operator_rerun_is_claimed_ahead_of_automatic_backlog(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET reason='automatic',priority=0")
+        conn.execute(
+            """INSERT INTO requests(broker_slug,broker_name,url,status,prepared_at,automation_status)
+            VALUES('priority-test','Priority Test','https://priority.test/privacy','prepared',?,'queued')""",
+            (now,),
+        )
+        selected_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.execute(
+            """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason,priority)
+            VALUES(?,?,?,'queued','Explicit operator rerun',100)""",
+            (selected_id, now, now),
+        )
+    claimed = QueueStore(app.db, "priority-worker").claim()
+    assert claimed["request_id"] == selected_id
+
+
+def test_overview_reports_queue_larger_than_activity_limit(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    now = app.utcnow()
+    with app.db() as conn:
+        for index in range(205):
+            conn.execute(
+                """INSERT INTO requests(broker_slug,broker_name,url,status,prepared_at,automation_status)
+                VALUES(?,?,?,?,?,'queued')""",
+                (f"bulk-{index}", f"Bulk {index}", f"https://bulk-{index}.test/privacy", "prepared", now),
+            )
+            request_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+            conn.execute(
+                """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason)
+                VALUES(?,?,?,'queued','automatic')""",
+                (request_id, now, now),
+            )
+    overview = app.automation_overview()
+    assert overview["queue"] == 206
+    assert overview["queue_due"] == 206
+    assert len(overview["activity"]) == 200
+
+
 def test_worker_records_actionable_failure(tmp_path, monkeypatch):
     request_id = configured_db(tmp_path, monkeypatch)
     assert make_worker(FakeExecutor(error=RuntimeError("browser executable missing"))).run_once()
@@ -69,6 +112,50 @@ def test_worker_records_actionable_failure(tmp_path, monkeypatch):
         queue = conn.execute("SELECT status,last_error FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
     assert queue["status"] == "failed"
     assert "browser executable missing" in queue["last_error"]
+    diagnostics = app.get_failure_diagnostics()
+    assert diagnostics[0]["stage"] == "tracking"
+    assert diagnostics[0]["observation"]["detected"]["worker_exception"] == "RuntimeError"
+
+
+def test_worker_records_redacted_page_controls_for_failed_attempt(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    observation = {
+        "page_title": "Privacy Request",
+        "headings": ["Tell us what you need"],
+        "controls": [{"index": 1, "type": "select", "label": "Request type", "required": True,
+                      "options": ["Delete my information", "Access my information"]}],
+        "detected": {"captcha": False, "required_unresolved": 1},
+        "attempted": {"filled_fields": ["email"], "selected_choices": [], "submit_authorized": True},
+    }
+    result = BrowserResult("needs_review", "inspection", "One required field needs review",
+                           "https://example.test/privacy", 90, diagnostics=observation)
+    assert make_worker(FakeExecutor(result=result)).run_once()
+    diagnostics = app.get_failure_diagnostics()
+    assert diagnostics[0]["request_id"] == request_id
+    assert diagnostics[0]["page_url"] == "https://example.test/privacy"
+    assert diagnostics[0]["observation"]["controls"][0]["options"] == [
+        "Delete my information", "Access my information"
+    ]
+    with app.db() as conn:
+        stored = conn.execute(
+            "SELECT observation FROM failure_diagnostics WHERE request_id=?", (request_id,)
+        ).fetchone()["observation"]
+    serialized = app.decrypt(stored)
+    assert "test@example.com" not in serialized
+
+
+def test_failure_report_groups_similar_reasons_and_downloads_markdown(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    app.record_failure_diagnostic(request_id, None, "inspection", "needs_review",
+                                  "2 required fields need review", "https://example.test/privacy", {})
+    app.record_failure_diagnostic(request_id, None, "inspection", "needs_review",
+                                  "3 required fields need review", "https://example.test/privacy", {})
+    response = app.export_failure_report()
+    report = response.body.decode()
+    assert response.media_type == "text/markdown"
+    assert "attachment; filename=" in response.headers["content-disposition"]
+    assert "**2 occurrence(s) · inspection**" in report
+    assert "## Worker Test — diagnostic" in report
 
 
 def test_stale_running_job_is_recovered(tmp_path, monkeypatch):
@@ -141,7 +228,12 @@ def test_init_migrates_deployed_unique_status_queue_with_conflicting_active_rows
                 UNIQUE(request_id, status))"""
         )
         conn.execute(
-            """INSERT INTO runner_queue SELECT * FROM runner_queue_new_schema"""
+            """INSERT INTO runner_queue
+            (id,request_id,created_at,run_after,status,reason,attempts,worker_id,stage,
+             started_at,heartbeat_at,finished_at,last_error)
+            SELECT id,request_id,created_at,run_after,status,reason,attempts,worker_id,stage,
+                   started_at,heartbeat_at,finished_at,last_error
+            FROM runner_queue_new_schema"""
         )
         conn.execute("UPDATE runner_queue SET status='running',started_at=?,heartbeat_at=?", (now, now))
         conn.execute(

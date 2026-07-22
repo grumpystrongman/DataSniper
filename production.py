@@ -32,7 +32,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from app import (
     DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, decrypt, encrypt,
     get_identity_variants, profile, queue_eligible_requests, refresh_due_statuses,
-    setting, sync_catalog_plan, utcnow, record_submission_transaction,
+    setting, sync_catalog_plan, utcnow, record_submission_transaction, record_failure_diagnostic,
     store_automation_evidence, register_worker_control,
 )
 from automation import adapter_for
@@ -738,7 +738,7 @@ def start_production_services() -> None:
     from browser_worker import BrowserWorker, WorkerSupervisor
     browser_worker_supervisor = WorkerSupervisor(lambda: BrowserWorker(
         db, profile, get_identity_variants, setting, record_submission_transaction,
-        store_automation_evidence, audit,
+        store_automation_evidence, audit, record_failure_diagnostic,
     ))
     if os.environ.get("DATASNIPER_BROWSER_WORKER", "1") == "1":
         browser_worker_supervisor.start()
