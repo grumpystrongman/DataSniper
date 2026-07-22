@@ -9,6 +9,8 @@ services:
       DATASNIPER_ALLOWED_HOSTS: 127.0.0.1,localhost
       DATASNIPER_AUTOBACKUP: "1"
       DATASNIPER_ACCESS_LOG: "0"
+      DATASNIPER_BROWSER_WORKER: "1"
+      DATASNIPER_BROWSER_HEADLESS: "1"
       HIBP_API_KEY: ${HIBP_API_KEY:-}
     volumes:
       - ./data:/app/data

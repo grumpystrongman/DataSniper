@@ -293,3 +293,11 @@ Useful contributions include verified broker workflow updates, accessibility imp
 ---
 
 <p align="center"><strong>Privacy protection should not require becoming a privacy expert.</strong></p>
+The production service also starts a persistent Chromium worker. It atomically
+claims authorized queue items, launches the official privacy page, inspects and
+fills the form, submits supported workflows, verifies the response page, and
+records live stages and timestamps in the Automation Center. CAPTCHA, identity
+documents, legal attestations, and ambiguous required fields stop in an
+action-required state with the reason recorded. Set
+`DATASNIPER_BROWSER_WORKER=0` to disable execution; `queued` never implies
+active execution when the worker is disabled.

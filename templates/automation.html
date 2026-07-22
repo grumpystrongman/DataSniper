@@ -3,6 +3,13 @@
 <div class="card">
   <h1>Automation Center</h1>
   <p class="muted">DataSniper runs supported privacy work and leaves only identity checks, CAPTCHAs, legal attestations, and ambiguous matches for you.</p>
+  {% if overview.worker.online %}
+  <div class="good"><strong>Background browser worker enabled.</strong> {{ overview.running }} currently running{% if overview.worker.heartbeat %} · last heartbeat {{ overview.worker.heartbeat }}{% endif %}. This page refreshes every 5 seconds while work is active.</div>
+  {% elif overview.worker.configured %}
+  <div class="notice"><strong>Background browser worker is offline.</strong> Queued work is not currently executing.{% if overview.worker.detail %} {{ overview.worker.detail }}.{% endif %} Restart DataSniper and review the service log.</div>
+  {% else %}
+  <div class="notice"><strong>Background browser worker disabled.</strong> Set <code>DATASNIPER_BROWSER_WORKER=1</code> and restart DataSniper. Queued work will not run until then.</div>
+  {% endif %}
   <div class="grid">
     <div><div class="metric">{{ overview.full }}</div><div class="muted">fully automated</div></div>
     <div><div class="metric">{{ overview.assisted }}</div><div class="muted">assisted</div></div>
@@ -11,6 +18,17 @@
     <div><div class="metric">{{ overview.attention }}</div><div class="muted">need attention</div></div>
   </div>
 </div>
+<div class="card">
+  <h2>Live execution</h2>
+  {% for job in overview.activity %}
+  <div class="task-row">
+    <div><strong>{{ job.broker_name }}</strong><br><span class="status {{ job.status }}">{{ job.status }}</span> · {{ (job.stage or 'scheduled').replace('_',' ') }}
+      {% if job.last_error %}<br><span class="next-action">{{ job.last_error }}</span>{% endif %}</div>
+    <small>queued {{ job.created_at }}{% if job.started_at %}<br>started {{ job.started_at }}{% endif %}{% if job.heartbeat_at %}<br>updated {{ job.heartbeat_at }}{% endif %}{% if job.finished_at %}<br>finished {{ job.finished_at }}{% endif %}</small>
+  </div>
+  {% else %}<p>No browser jobs have been scheduled.</p>{% endfor %}
+</div>
+{% if overview.running or overview.queue %}<script>setTimeout(()=>location.reload(),5000)</script>{% endif %}
 <div class="card">
   <h2>Authorization policy</h2>
   <p class="muted">A broker must also be authorized below before DataSniper can submit. CAPTCHA, ID upload, consent, and legal attestations always pause.</p>

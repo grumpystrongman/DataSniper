@@ -230,6 +230,12 @@ def init_db() -> None:
                 status TEXT NOT NULL DEFAULT 'queued',
                 reason TEXT NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
+                worker_id TEXT,
+                stage TEXT NOT NULL DEFAULT 'scheduled',
+                started_at TEXT,
+                heartbeat_at TEXT,
+                finished_at TEXT,
+                last_error TEXT NOT NULL DEFAULT '',
                 UNIQUE(request_id, status)
             );
             """
@@ -256,6 +262,15 @@ def init_db() -> None:
         for name, definition in registry_migrations.items():
             if name not in registry_columns:
                 conn.execute(f"ALTER TABLE broker_registry ADD COLUMN {name} {definition}")
+        queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runner_queue)")}
+        queue_migrations = {
+            "worker_id": "TEXT", "stage": "TEXT NOT NULL DEFAULT 'scheduled'",
+            "started_at": "TEXT", "heartbeat_at": "TEXT", "finished_at": "TEXT",
+            "last_error": "TEXT NOT NULL DEFAULT ''",
+        }
+        for name, definition in queue_migrations.items():
+            if name not in queue_columns:
+                conn.execute(f"ALTER TABLE runner_queue ADD COLUMN {name} {definition}")
         for broker in BROKERS:
             adapter = adapter_for(broker["slug"], broker["url"])
             conn.execute(
@@ -326,7 +341,11 @@ def automation_overview() -> dict[str, Any]:
             r.match_score,b.support_level,b.health_status,b.authorized,b.attempt_count
             FROM requests r LEFT JOIN broker_automation b ON b.broker_slug=r.broker_slug"""
         ).fetchall()
-        queue = conn.execute("SELECT COUNT(*) FROM runner_queue WHERE status='queued'").fetchone()[0]
+        queue_rows = conn.execute(
+            """SELECT q.*,r.broker_name FROM runner_queue q JOIN requests r ON r.id=q.request_id
+            WHERE q.status IN ('queued','running','attention','failed') ORDER BY q.id DESC LIMIT 100"""
+        ).fetchall()
+        queue = sum(row["status"] == "queued" for row in queue_rows)
     items = []
     for row in rows:
         item = dict(row)
@@ -336,6 +355,13 @@ def automation_overview() -> dict[str, Any]:
             True,
         )
         items.append(item)
+    heartbeat = setting("browser_worker_heartbeat") or ""
+    heartbeat_fresh = False
+    if heartbeat:
+        try:
+            heartbeat_fresh = datetime.fromisoformat(heartbeat.replace("Z", "+00:00")) >= datetime.now().astimezone() - timedelta(seconds=30)
+        except ValueError:
+            pass
     return {
         "items": items,
         "queue": queue,
@@ -343,7 +369,33 @@ def automation_overview() -> dict[str, Any]:
         "assisted": sum(item["support_level"] == "assisted" for item in items),
         "manual": sum(item["support_level"] == "manual" for item in items),
         "attention": sum(item["automation_status"] in {"human_action_required", "failed"} for item in items),
+        "running": sum(row["status"] == "running" for row in queue_rows),
+        "worker": {
+            "configured": os.environ.get("DATASNIPER_BROWSER_WORKER", "1") == "1",
+            "online": setting("browser_worker_state") == "online" and heartbeat_fresh,
+            "heartbeat": heartbeat,
+            "detail": setting("browser_worker_detail") or "",
+        },
+        "activity": [dict(row) for row in queue_rows],
     }
+
+
+def store_automation_evidence(request_id: int, content: bytes, filename: str, note: str) -> None:
+    """Encrypt a worker capture without exposing identity data in its metadata."""
+    if not content or len(content) > 5 * 1024 * 1024:
+        raise ValueError("Automation evidence must be between 1 byte and 5 MB")
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM requests WHERE id=?", (request_id,)).fetchone():
+            raise LookupError("Request not found")
+    stored_name = f"{uuid.uuid4().hex}.vault"
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    (EVIDENCE_DIR / stored_name).write_bytes(Fernet(key()).encrypt(content))
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO evidence(request_id,filename,stored_name,content_type,size,note,created_at)
+            VALUES(?,?,?,?,?,?,?)""",
+            (request_id, encrypt(filename[:200]), stored_name, "image/png", len(content), encrypt(note[:500]), utcnow()),
+        )
 
 
 def queue_eligible_requests() -> int:
@@ -1147,18 +1199,8 @@ def api_evidence_capture(task_id: int, payload: dict[str, Any], token: str):
         row = conn.execute("SELECT broker_name FROM requests WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Task not found")
-    stored_name = f"{uuid.uuid4().hex}.vault"
-    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
-    (EVIDENCE_DIR / stored_name).write_bytes(Fernet(key()).encrypt(content))
     filename = str(payload.get("filename", "automation-evidence.png"))[:200]
-    with db() as conn:
-        conn.execute(
-            """INSERT INTO evidence
-            (request_id,filename,stored_name,content_type,size,note,created_at)
-            VALUES(?,?,?,?,?,?,?)""",
-            (task_id, encrypt(filename), stored_name, str(payload.get("content_type", "image/png"))[:100],
-             len(content), encrypt("Automatically captured submission evidence"), utcnow()),
-        )
+    store_automation_evidence(task_id, content, filename, "Automatically captured submission evidence")
     audit("evidence_captured", f"Encrypted automation evidence captured for {row['broker_name']}")
     return {"ok": True}
 
