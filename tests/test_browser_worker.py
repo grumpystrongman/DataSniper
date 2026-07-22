@@ -9,6 +9,10 @@ class FakeExecutor:
         self.result = result or BrowserResult("submitted", "confirmation", "Broker accepted the request", "https://example.test/done", 90)
         self.error = error
         self.closed = False
+        self.started = False
+
+    def start(self):
+        self.started = True
 
     def run(self, job, profile, variants, policy, progress):
         progress("browser_launched")
@@ -156,11 +160,15 @@ def test_worker_supervisor_restarts_without_parallel_workers():
         def __init__(self):
             import threading
             self.stop_event = threading.Event()
+            self.wake_event = threading.Event()
             self.store = type("Store", (), {"worker_status": lambda *args: None})()
             workers.append(self)
 
         def run_forever(self):
             self.stop_event.wait()
+
+        def wake(self):
+            self.wake_event.set()
 
     supervisor = WorkerSupervisor(FakeWorker)
     assert supervisor.start()["state"] == "starting"
@@ -268,3 +276,72 @@ def test_empty_bulk_action_returns_to_work_queue_with_guidance(tmp_path, monkeyp
     assert page.status_code == 200
     assert "Select at least one item before applying an action." in page.text
     assert 'id="selection-error"' in page.text
+
+
+def test_subset_run_wakes_worker_and_reports_progress(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='completed',finished_at=?", (app.utcnow(),))
+        conn.execute("UPDATE requests SET automation_status='awaiting_response'")
+    actions = []
+    monkeypatch.setattr(app, "_worker_control", lambda action: actions.append(action) or {
+        "state": "waking", "detail": "Worker notified that new work is ready"
+    })
+    from fastapi.testclient import TestClient
+    client = TestClient(app.app, base_url="http://localhost")
+    response = client.post("/automation/bulk", data={"action": "run", "request_ids": str(request_id)}, follow_redirects=False)
+    assert response.status_code == 303
+    assert actions == ["wake"]
+    assert "run_count=1" in response.headers["location"]
+    with app.db() as conn:
+        row = conn.execute("SELECT status,stage FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+    assert tuple(row) == ("queued", "scheduled")
+
+
+def test_subset_run_advances_through_real_supervisor(tmp_path, monkeypatch):
+    import time
+    request_id = configured_db(tmp_path, monkeypatch)
+    with app.db() as conn:
+        conn.execute("UPDATE runner_queue SET status='completed',finished_at=?", (app.utcnow(),))
+        conn.execute("UPDATE requests SET automation_status='awaiting_response'")
+    executor = FakeExecutor()
+    supervisor = WorkerSupervisor(lambda: make_worker(executor))
+    monkeypatch.setattr(app, "_worker_control", lambda action: getattr(supervisor, action)())
+    from fastapi.testclient import TestClient
+    try:
+        response = TestClient(app.app, base_url="http://localhost").post(
+            "/automation/bulk", data={"action": "run", "request_ids": str(request_id)}, follow_redirects=False
+        )
+        assert response.status_code == 303
+        for _ in range(100):
+            with app.db() as conn:
+                row = conn.execute("SELECT status,started_at,finished_at FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
+            if row["status"] == "completed":
+                break
+            time.sleep(0.01)
+        assert tuple(row) == ("completed", row["started_at"], row["finished_at"])
+        assert row["started_at"] and row["finished_at"]
+        assert executor.started is True
+    finally:
+        supervisor.shutdown()
+
+
+def test_browser_startup_failure_is_visible_and_not_reported_online(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    executor = FakeExecutor()
+    executor.start = lambda: (_ for _ in ()).throw(RuntimeError("Chromium executable missing"))
+    worker = make_worker(executor)
+    worker.run_forever()
+    status = app.automation_overview()["worker"]
+    assert status["state"] == "failed"
+    assert status["online"] is False
+    assert "Chromium executable missing" in status["detail"]
+
+
+def test_worker_is_not_online_until_browser_is_ready(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    executor = FakeExecutor(error=RuntimeError("unused"))
+    worker = make_worker(executor)
+    worker.stop_event.set()
+    worker.run_forever()
+    assert executor.started is True
