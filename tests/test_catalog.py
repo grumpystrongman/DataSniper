@@ -171,6 +171,60 @@ def test_registry_refresh_deduplicates_existing_entities(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM broker_registry").fetchone()[0] == 1
 
 
+def test_coverage_registry_entry_becomes_tracked_automated_case(tmp_path):
+    app, production = configure(tmp_path)
+    production.ingest_registry_csv(
+        "california",
+        "Registration ID,Data Broker Name,Delete URL\n123,Example Data,https://example.com/privacy",
+    )
+    with app.db() as conn:
+        registry_id = conn.execute("SELECT id FROM broker_registry").fetchone()[0]
+
+    request_id = app.activate_registry_broker(registry_id, authorize=True)
+    with app.db() as conn:
+        request = conn.execute("SELECT * FROM requests WHERE id=?", (request_id,)).fetchone()
+        control = conn.execute(
+            "SELECT support_level,authorized FROM broker_automation WHERE broker_slug=?",
+            (request["broker_slug"],),
+        ).fetchone()
+        registry = conn.execute(
+            "SELECT workflow_status,next_action FROM broker_registry WHERE id=?", (registry_id,)
+        ).fetchone()
+        interactions = conn.execute(
+            "SELECT COUNT(*) FROM coverage_interactions WHERE registry_id=?", (registry_id,)
+        ).fetchone()[0]
+    assert request["registry_id"] == registry_id
+    assert tuple(control) == ("full", 1)
+    assert registry["workflow_status"] == "queued"
+    assert registry["next_action"]
+    assert interactions == 1
+
+
+def test_coverage_submission_updates_status_and_history(tmp_path):
+    app, production = configure(tmp_path)
+    production.ingest_registry_csv(
+        "california",
+        "Registration ID,Data Broker Name,Delete URL\n123,Example Data,https://example.com/privacy",
+    )
+    with app.db() as conn:
+        registry_id = conn.execute("SELECT id FROM broker_registry").fetchone()[0]
+    request_id = app.activate_registry_broker(registry_id, authorize=True)
+
+    app.record_submission_transaction(
+        request_id, "submission", "submitted", detail="Official form accepted", automated=True,
+    )
+    with app.db() as conn:
+        registry = conn.execute(
+            "SELECT workflow_status,next_action FROM broker_registry WHERE id=?", (registry_id,)
+        ).fetchone()
+        statuses = [row[0] for row in conn.execute(
+            "SELECT status FROM coverage_interactions WHERE registry_id=? ORDER BY id", (registry_id,)
+        )]
+    assert registry["workflow_status"] == "awaiting_feedback"
+    assert "Await" in registry["next_action"]
+    assert statuses == ["queued", "awaiting_feedback"]
+
+
 def test_submission_transactions_update_task_and_preserve_history(tmp_path):
     app, _ = configure(tmp_path)
     with app.db() as conn:
@@ -212,3 +266,39 @@ def test_submission_transaction_rejects_unknown_state(tmp_path):
     import pytest
     with pytest.raises(ValueError):
         app.record_submission_transaction(request_id, "bypass", "captcha_solved")
+
+
+def test_automation_controls_and_runner_queue(tmp_path):
+    app, _ = configure(tmp_path)
+    now = app.utcnow()
+    with app.db() as conn:
+        conn.execute(
+            """INSERT INTO profile
+            (id,full_name,email,phone,address,city,state,postal_code,birth_year,helper_name,created_at,updated_at)
+            VALUES(1,?,?,?,?,?,?,?,?,?,?,?)""",
+            (app.encrypt("Test Person"), app.encrypt("test@example.com"), "", "", "", "VA", "", "", "", now, now),
+        )
+    app.build_plan("VA")
+    assert app.queue_eligible_requests() > 0
+    overview = app.automation_overview()
+    assert overview["queue"] > 0
+    assert overview["full"] > 0
+
+
+def test_mail_receipt_schema_deduplicates_fingerprints(tmp_path):
+    app, _ = configure(tmp_path)
+    with app.db() as conn:
+        first = conn.execute(
+            """INSERT OR IGNORE INTO mail_receipts
+            (fingerprint,received_at,sender,subject,kind,processed_at)
+            VALUES('same','2026-01-01',?,?,?,?)""",
+            (app.encrypt("broker@example.com"), app.encrypt("Request received"), "accepted", app.utcnow()),
+        )
+        second = conn.execute(
+            """INSERT OR IGNORE INTO mail_receipts
+            (fingerprint,received_at,sender,subject,kind,processed_at)
+            VALUES('same','2026-01-01',?,?,?,?)""",
+            (app.encrypt("broker@example.com"), app.encrypt("Request received"), "accepted", app.utcnow()),
+        )
+    assert first.rowcount == 1
+    assert second.rowcount == 0

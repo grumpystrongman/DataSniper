@@ -3,16 +3,21 @@
 <div class="card">
   <p><a href="/">← Back</a></p>
   <h1>Broker Coverage</h1>
-  <div class="grid"><div><div class="metric">{{ summary.total }}</div><div class="muted">official entities monitored</div></div><div><div class="metric">{{ summary.new or 0 }}</div><div class="muted">new since last review</div></div><div><div class="metric">{{ summary.verified or 0 }}</div><div class="muted">registry paths verified</div></div></div>
-  <p>DataSniper audits official data-broker registries daily. A registry record is not proof that a broker holds your data; it is a company worth checking. Candidate links never become removal tasks until their free official process is verified.</p>
+  <div class="grid"><div><div class="metric">{{ summary.total }}</div><div class="muted">official entities monitored</div></div><div><div class="metric">{{ summary.workflow_queued or 0 }}</div><div class="muted">queued</div></div><div><div class="metric">{{ summary.workflow_awaiting_feedback or 0 }}</div><div class="muted">awaiting feedback</div></div><div><div class="metric">{{ summary.workflow_completed or 0 }}</div><div class="muted">completed</div></div><div><div class="metric">{{ (summary.workflow_action_required or 0) + (summary.workflow_failed or 0) }}</div><div class="muted">need attention</div></div></div>
+  <p>DataSniper audits official data-broker registries daily and turns eligible CCPA privacy paths into tracked removal cases. It fills and submits forms when the workflow is unambiguous; CAPTCHA, attestations, ID requests, and unresolved fields pause for you without losing progress.</p>
   {% if last_run %}<p class="muted">Last registry audit: {{ last_run }}</p>{% endif %}
-  <form method="post" action="/coverage/check-now"><button type="submit">Refresh official registries</button></form>
+  <div class="actions"><form method="post" action="/coverage/queue-all"><button type="submit" class="success">Queue all eligible CCPA deletions</button></form><form method="post" action="/coverage/check-now"><button type="submit" class="secondary">Refresh official registries</button></form></div>
+  <p class="muted">Bulk queue authorizes submissions only to official HTTPS privacy paths. Each attempt and outcome is recorded.</p>
 </div>
 <div class="card">
-  <h2>Registry entities</h2>
+  <h2>Removal workbench</h2>
   {% if not brokers %}<div class="notice">The first registry import has not completed yet. Run a refresh above or leave the daily agent running.</div>{% endif %}
   {% for broker in brokers %}
-  <div class="task-row"><div class="details"><strong>{{ broker.legal_name }}</strong><br><span class="muted">{{ broker.source|title }} registry · {{ broker.review_status.replace('_',' ') }}</span></div><div>{% if broker.privacy_url %}<a class="button secondary" href="{{ broker.privacy_url }}" target="_blank" rel="noopener">Candidate privacy path</a>{% elif broker.website %}<a class="button secondary" href="{{ broker.website }}" target="_blank" rel="noopener">Website</a>{% endif %}</div></div>
+  <div class="coverage-row">
+    <div class="coverage-main"><strong>{{ broker.legal_name }}</strong> <span class="status {{ broker.workflow_status }}">{{ broker.workflow_status.replace('_',' ') }}</span><br><span class="muted">{{ broker.source|title }} registry · {{ broker.review_status.replace('_',' ') }} · {{ broker.interaction_count }} recorded interaction{{ '' if broker.interaction_count == 1 else 's' }}</span>{% if broker.next_action %}<br><span class="next-action"><strong>Next:</strong> {{ broker.next_action }}</span>{% endif %}{% if broker.last_interaction_at %}<br><small class="muted">Last activity {{ broker.last_interaction_at }}</small>{% endif %}</div>
+    <div class="coverage-actions">{% if broker.request_id %}<a class="button secondary" href="/task/{{ broker.request_id }}">Open case</a>{% elif broker.privacy_url %}<form method="post" action="/coverage/{{ broker.id }}/queue"><button type="submit">Queue deletion</button></form>{% elif broker.website %}<a class="button secondary" href="{{ broker.website }}" target="_blank" rel="noopener">Find privacy path</a>{% endif %}</div>
+    <form class="coverage-update" method="post" action="/coverage/{{ broker.id }}/status"><select name="status" aria-label="Workflow status"><option value="not_started">Not started</option><option value="queued">Queued</option><option value="in_progress">In progress</option><option value="awaiting_feedback">Awaiting feedback</option><option value="action_required">Action required</option><option value="completed">Completed</option><option value="failed">Failed</option><option value="not_applicable">Not applicable</option></select><input name="note" placeholder="Record a note or broker response"><button class="secondary" type="submit">Record update</button></form>
+  </div>
   {% endfor %}
 </div>
 {% endblock %}

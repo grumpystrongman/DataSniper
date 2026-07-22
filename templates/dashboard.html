@@ -11,6 +11,12 @@
     <div><div class="metric">{{ summary.exposures }}</div><div class="muted">active breach findings</div></div>
   </div>
 </div>
+<div class="card {% if automation.attention %}notice{% endif %}">
+  <h2>Privacy autopilot</h2>
+  <p><strong>{{ automation.full }}</strong> fully automated · <strong>{{ automation.assisted }}</strong> assisted · <strong>{{ automation.queue }}</strong> queued · <strong>{{ automation.attention }}</strong> exceptions</p>
+  <p class="muted">The daily runner prepares supported work and sends only ambiguous matches, CAPTCHAs, attestations, and broken workflows to your attention queue.</p>
+  <a class="button" href="/automation">Open Automation Center</a>
+</div>
 <div class="card {% if summary.exposures %}notice{% endif %}">
   <h2>Exposure monitor</h2>
   {% if summary.exposures %}<p><strong>{{ summary.exposures }} finding(s) need action.</strong> DataSniper has translated the breach data into concrete next steps.</p>{% else %}<p class="muted">No active breach findings are stored. The agent checks configured accounts daily.</p>{% endif %}

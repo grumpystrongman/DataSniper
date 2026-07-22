@@ -19,6 +19,11 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from broker_catalog import BROKERS, CATALOG_VERSION, broker_by_slug
+from automation import (
+    AUTHORIZATION_POLICIES, adapter_for, classify_confirmation_page,
+    classify_mail, match_identity, may_submit, message_fingerprint, support_score,
+    retry_due,
+)
 
 APP_NAME = "DataSniper Privacy Agent"
 ROOT = Path(__file__).resolve().parent
@@ -169,6 +174,17 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_registry_review
             ON broker_registry(review_status, legal_name);
+            CREATE TABLE IF NOT EXISTS coverage_interactions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                registry_id INTEGER NOT NULL REFERENCES broker_registry(id) ON DELETE CASCADE,
+                request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL,
+                event_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                automated INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_coverage_interactions
+            ON coverage_interactions(registry_id, id DESC);
             CREATE TABLE IF NOT EXISTS submission_transactions (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
@@ -183,6 +199,39 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_submission_request
             ON submission_transactions(request_id, id DESC);
+            CREATE TABLE IF NOT EXISTS broker_automation (
+                broker_slug TEXT PRIMARY KEY,
+                adapter_version INTEGER NOT NULL,
+                support_level TEXT NOT NULL,
+                health_status TEXT NOT NULL DEFAULT 'untested',
+                health_checked_at TEXT,
+                health_detail TEXT NOT NULL DEFAULT '',
+                authorized INTEGER NOT NULL DEFAULT 0,
+                authorization_at TEXT,
+                attempt_count INTEGER NOT NULL DEFAULT 0,
+                last_attempt_at TEXT
+            );
+            CREATE TABLE IF NOT EXISTS mail_receipts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                fingerprint TEXT NOT NULL UNIQUE,
+                request_id INTEGER REFERENCES requests(id) ON DELETE SET NULL,
+                received_at TEXT NOT NULL,
+                sender TEXT NOT NULL,
+                subject TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                action_url TEXT,
+                processed_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS runner_queue (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                created_at TEXT NOT NULL,
+                run_after TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'queued',
+                reason TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                UNIQUE(request_id, status)
+            );
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
@@ -193,10 +242,32 @@ def init_db() -> None:
             "confirmation_status": "TEXT NOT NULL DEFAULT 'not_expected'",
             "automation_status": "TEXT NOT NULL DEFAULT 'not_started'",
             "match_score": "INTEGER",
+            "registry_id": "INTEGER REFERENCES broker_registry(id)",
         }
         for name, definition in migrations.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE requests ADD COLUMN {name} {definition}")
+        registry_columns = {row["name"] for row in conn.execute("PRAGMA table_info(broker_registry)")}
+        registry_migrations = {
+            "workflow_status": "TEXT NOT NULL DEFAULT 'not_started'",
+            "next_action": "TEXT NOT NULL DEFAULT ''",
+            "last_interaction_at": "TEXT",
+        }
+        for name, definition in registry_migrations.items():
+            if name not in registry_columns:
+                conn.execute(f"ALTER TABLE broker_registry ADD COLUMN {name} {definition}")
+        for broker in BROKERS:
+            adapter = adapter_for(broker["slug"], broker["url"])
+            conn.execute(
+                """INSERT INTO broker_automation
+                (broker_slug,adapter_version,support_level) VALUES(?,?,?)
+                ON CONFLICT(broker_slug) DO UPDATE SET
+                adapter_version=excluded.adapter_version,support_level=excluded.support_level""",
+                (broker["slug"], adapter.version, adapter.level),
+            )
+        conn.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES('authorization_policy','ask')"
+        )
 
 
 def profile() -> dict[str, str] | None:
@@ -248,6 +319,56 @@ def get_submission_transactions(request_id: int | None = None) -> list[dict[str,
     return result
 
 
+def automation_overview() -> dict[str, Any]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT r.id,r.broker_slug,r.broker_name,r.status,r.automation_status,
+            r.match_score,b.support_level,b.health_status,b.authorized,b.attempt_count
+            FROM requests r LEFT JOIN broker_automation b ON b.broker_slug=r.broker_slug"""
+        ).fetchall()
+        queue = conn.execute("SELECT COUNT(*) FROM runner_queue WHERE status='queued'").fetchone()[0]
+    items = []
+    for row in rows:
+        item = dict(row)
+        item["support_score"] = support_score(
+            item.get("support_level") or "manual",
+            item.get("health_status") in {"healthy", "untested"},
+            True,
+        )
+        items.append(item)
+    return {
+        "items": items,
+        "queue": queue,
+        "full": sum(item["support_level"] == "full" for item in items),
+        "assisted": sum(item["support_level"] == "assisted" for item in items),
+        "manual": sum(item["support_level"] == "manual" for item in items),
+        "attention": sum(item["automation_status"] in {"human_action_required", "failed"} for item in items),
+    }
+
+
+def queue_eligible_requests() -> int:
+    now = utcnow()
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT r.id,r.broker_slug,r.url,b.support_level,b.authorized,b.health_status,
+            b.attempt_count,b.last_attempt_at
+            FROM requests r JOIN broker_automation b ON b.broker_slug=r.broker_slug
+            WHERE r.status IN ('prepared','verification_due')
+            AND b.support_level IN ('full','assisted') AND b.health_status != 'broken'"""
+        ).fetchall()
+        count = 0
+        for row in rows:
+            if not retry_due(row["attempt_count"], row["last_attempt_at"], adapter_for(row["broker_slug"], row["url"])):
+                continue
+            reason = "automatic" if row["support_level"] == "full" and row["authorized"] else "assisted"
+            cur = conn.execute(
+                """INSERT OR IGNORE INTO runner_queue(request_id,created_at,run_after,status,reason)
+                VALUES(?,?,?,'queued',?)""", (row["id"], now, now, reason)
+            )
+            count += cur.rowcount
+    return count
+
+
 def record_submission_transaction(
     request_id: int, stage: str, outcome: str, *, page_url: str = "",
     match_score: int | None = None, confirmation: str = "", detail: str = "",
@@ -259,7 +380,7 @@ def record_submission_transaction(
         raise ValueError("Unsupported submission transaction")
     score = None if match_score is None else max(0, min(100, int(match_score)))
     with db() as conn:
-        row = conn.execute("SELECT broker_name FROM requests WHERE id=?", (request_id,)).fetchone()
+        row = conn.execute("SELECT broker_name,registry_id FROM requests WHERE id=?", (request_id,)).fetchone()
         if not row:
             raise LookupError("Request not found")
         conn.execute(
@@ -274,6 +395,33 @@ def record_submission_transaction(
                   "filled": "ready_to_submit", "matched": "match_found", "no_match": "no_match"}.get(outcome, "running")
         conn.execute("UPDATE requests SET automation_status=?,match_score=COALESCE(?,match_score) WHERE id=?",
                      (status, score, request_id))
+        if stage == "submission":
+            conn.execute(
+                """UPDATE broker_automation SET attempt_count=attempt_count+1,last_attempt_at=?
+                WHERE broker_slug=(SELECT broker_slug FROM requests WHERE id=?)""",
+                (utcnow(), request_id),
+            )
+        if outcome in {"submitted", "confirmed"}:
+            conn.execute("UPDATE runner_queue SET status='completed' WHERE request_id=? AND status='queued'", (request_id,))
+        elif outcome in {"blocked", "needs_review", "failed"}:
+            conn.execute("UPDATE runner_queue SET status='attention' WHERE request_id=? AND status='queued'", (request_id,))
+    if row["registry_id"]:
+        coverage_status = {
+            "started": "in_progress", "matched": "in_progress", "filled": "in_progress",
+            "submitted": "awaiting_feedback", "confirmed": "completed",
+            "blocked": "action_required", "needs_review": "action_required",
+            "failed": "failed", "no_match": "not_applicable",
+        }[outcome]
+        next_action = {
+            "blocked": "Complete the CAPTCHA or human-verification step",
+            "needs_review": "Review unresolved fields or consent choices",
+            "submitted": "Await confirmation from the broker",
+            "failed": "Review the failure and retry when ready",
+        }.get(outcome, "")
+        record_coverage_interaction(
+            row["registry_id"], coverage_status, detail or f"Automation {stage}: {outcome}",
+            request_id=request_id, automated=automated, next_action=next_action,
+        )
     audit("automation_" + outcome, f"{row['broker_name']}: {stage} {outcome}")
 
 
@@ -302,6 +450,89 @@ def registry_summary() -> dict[str, int]:
     counts = {row["review_status"]: row["count"] for row in rows}
     counts["total"] = sum(counts.values())
     return counts
+
+
+def coverage_summary() -> dict[str, int]:
+    counts = registry_summary()
+    with db() as conn:
+        workflows = conn.execute(
+            "SELECT workflow_status,COUNT(*) count FROM broker_registry GROUP BY workflow_status"
+        ).fetchall()
+    counts.update({f"workflow_{row['workflow_status']}": row["count"] for row in workflows})
+    return counts
+
+
+COVERAGE_STATUSES = {
+    "not_started", "queued", "in_progress", "awaiting_feedback", "action_required",
+    "completed", "failed", "not_applicable",
+}
+
+
+def _registry_slug(source: str, source_id: str) -> str:
+    digest = hashlib.sha256(f"{source}\0{source_id}".encode()).hexdigest()[:16]
+    return f"registry-{source}-{digest}"[:100]
+
+
+def record_coverage_interaction(
+    registry_id: int, status: str, detail: str, *, request_id: int | None = None,
+    automated: bool = False, next_action: str = "",
+) -> None:
+    if status not in COVERAGE_STATUSES:
+        raise ValueError("Unsupported coverage status")
+    now = utcnow()
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM broker_registry WHERE id=?", (registry_id,)).fetchone():
+            raise LookupError("Registry entity not found")
+        conn.execute(
+            """INSERT INTO coverage_interactions
+            (registry_id,request_id,event_at,status,detail,automated) VALUES(?,?,?,?,?,?)""",
+            (registry_id, request_id, now, status, detail[:2000], int(automated)),
+        )
+        conn.execute(
+            """UPDATE broker_registry SET workflow_status=?,next_action=?,last_interaction_at=?
+            WHERE id=?""", (status, next_action[:500], now, registry_id),
+        )
+
+
+def activate_registry_broker(registry_id: int, *, authorize: bool = False) -> int:
+    """Turn a registry discovery record into a tracked removal request."""
+    with db() as conn:
+        row = conn.execute("SELECT * FROM broker_registry WHERE id=?", (registry_id,)).fetchone()
+        if not row:
+            raise LookupError("Registry entity not found")
+        url = row["privacy_url"] or ""
+        if not url.startswith("https://"):
+            raise ValueError("No official HTTPS privacy request path is available")
+        slug = _registry_slug(row["source"], row["source_id"])
+        now = utcnow()
+        conn.execute(
+            """INSERT OR IGNORE INTO requests
+            (broker_slug,broker_name,url,status,prepared_at,notes,registry_id,automation_status)
+            VALUES(?,?,?,?,?,?,?,'queued')""",
+            (slug, row["legal_name"], url, "prepared", now,
+             "Official registry CCPA deletion/privacy request", registry_id),
+        )
+        request_id = conn.execute("SELECT id FROM requests WHERE broker_slug=?", (slug,)).fetchone()[0]
+        adapter = adapter_for(slug, url)
+        conn.execute(
+            """INSERT INTO broker_automation
+            (broker_slug,adapter_version,support_level,health_status,authorized,authorization_at)
+            VALUES(?,?,?,'untested',?,?) ON CONFLICT(broker_slug) DO UPDATE SET
+            authorized=MAX(authorized,excluded.authorized),
+            authorization_at=COALESCE(authorization_at,excluded.authorization_at)""",
+            (slug, adapter.version, adapter.level, int(authorize), now if authorize else None),
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO runner_queue(request_id,created_at,run_after,status,reason)
+            VALUES(?,?,?,'queued',?)""",
+            (request_id, now, now, "authorized CCPA deletion" if authorize else "CCPA deletion review"),
+        )
+    record_coverage_interaction(
+        registry_id, "queued", "CCPA deletion request queued from Coverage",
+        request_id=request_id, automated=True, next_action="Browser runner will open and process the official form",
+    )
+    return request_id
+    return request_id
 
 
 def audit(event_type: str, detail: str) -> None:
@@ -391,11 +622,49 @@ def home(request: Request):
     exposure_findings = get_exposure_findings()
     summary["exposures"] = sum(item["status"] in {"new", "acting"} for item in exposure_findings)
     summary["registry"] = registry_summary()
+    automation = automation_overview()
     return templates.TemplateResponse(
         request, "dashboard.html",
         {"profile": p, "requests": requests, "next_task": next_task, "summary": summary,
-         "identity_variants": get_identity_variants(), "exposure_findings": exposure_findings[:3]},
+         "identity_variants": get_identity_variants(), "exposure_findings": exposure_findings[:3],
+         "automation": automation},
     )
+
+
+@app.get("/automation", response_class=HTMLResponse)
+def automation_center(request: Request):
+    return templates.TemplateResponse(request, "automation.html", {
+        "overview": automation_overview(),
+        "policy": setting("authorization_policy") or "ask",
+        "mail_configured": bool(os.environ.get("DATASNIPER_IMAP_HOST", "").strip()),
+    })
+
+
+@app.post("/automation/policy")
+def update_automation_policy(policy: str = Form(...)):
+    if policy not in AUTHORIZATION_POLICIES:
+        raise HTTPException(400, "Unsupported authorization policy")
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO settings(key,value) VALUES('authorization_policy',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (policy,)
+        )
+    audit("automation_policy_updated", f"Automation policy changed to {policy}")
+    return RedirectResponse("/automation", status_code=303)
+
+
+@app.post("/automation/{broker_slug}/authorization")
+def update_broker_authorization(broker_slug: str, authorized: bool = Form(False)):
+    with db() as conn:
+        row = conn.execute("SELECT broker_slug FROM broker_automation WHERE broker_slug=?", (broker_slug,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Broker automation not found")
+        conn.execute(
+            "UPDATE broker_automation SET authorized=?,authorization_at=? WHERE broker_slug=?",
+            (int(authorized), utcnow() if authorized else None, broker_slug),
+        )
+    audit("broker_authorization_updated", f"{broker_slug} automatic submission {'enabled' if authorized else 'disabled'}")
+    return RedirectResponse("/automation", status_code=303)
 
 
 @app.get("/exposures", response_class=HTMLResponse)
@@ -425,16 +694,78 @@ def exposure_status(finding_id: int, status: str = Form(...)):
 def coverage(request: Request):
     with db() as conn:
         rows = conn.execute(
-            """SELECT source,legal_name,website,privacy_url,review_status,last_seen_at
-            FROM broker_registry ORDER BY
-            CASE review_status WHEN 'new' THEN 1 WHEN 'candidate' THEN 2 WHEN 'verified' THEN 3 ELSE 4 END,
+            """SELECT br.*,r.id request_id,r.status request_status,r.automation_status,
+            (SELECT COUNT(*) FROM coverage_interactions ci WHERE ci.registry_id=br.id) interaction_count
+            FROM broker_registry br LEFT JOIN requests r ON r.registry_id=br.id ORDER BY
+            CASE br.workflow_status WHEN 'action_required' THEN 1 WHEN 'failed' THEN 2
+              WHEN 'awaiting_feedback' THEN 3 WHEN 'in_progress' THEN 4 WHEN 'queued' THEN 5
+              WHEN 'not_started' THEN 6 ELSE 7 END,
             legal_name LIMIT 1000"""
         ).fetchall()
     return templates.TemplateResponse(request, "coverage.html", {
         "brokers": [dict(row) for row in rows],
-        "summary": registry_summary(),
+        "summary": coverage_summary(),
         "last_run": setting("registry_audit_last_run"),
     })
+
+
+@app.post("/coverage/queue-all")
+def queue_all_coverage_requests():
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT id FROM broker_registry WHERE privacy_url LIKE 'https://%'
+            AND workflow_status IN ('not_started','failed') ORDER BY id"""
+        ).fetchall()
+    queued = failed = 0
+    for row in rows:
+        try:
+            activate_registry_broker(row["id"], authorize=True)
+            queued += 1
+        except (LookupError, ValueError, sqlite3.Error):
+            failed += 1
+    audit("coverage_bulk_queued", f"{queued} CCPA deletion request(s) queued; {failed} failed")
+    return RedirectResponse("/coverage", status_code=303)
+
+
+@app.post("/coverage/{registry_id}/queue")
+def queue_coverage_request(registry_id: int):
+    try:
+        request_id = activate_registry_broker(registry_id, authorize=True)
+    except LookupError:
+        raise HTTPException(404, "Registry entity not found")
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+    audit("coverage_request_queued", f"Registry request {request_id} queued for automation")
+    return RedirectResponse("/coverage", status_code=303)
+
+
+@app.post("/coverage/{registry_id}/status")
+def update_coverage_status(registry_id: int, status: str = Form(...), note: str = Form("")):
+    if status not in COVERAGE_STATUSES:
+        raise HTTPException(400, "Unsupported coverage status")
+    with db() as conn:
+        row = conn.execute("SELECT legal_name FROM broker_registry WHERE id=?", (registry_id,)).fetchone()
+        request = conn.execute("SELECT id FROM requests WHERE registry_id=?", (registry_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Registry entity not found")
+    record_coverage_interaction(
+        registry_id, status, note.strip() or f"Manually marked {status.replace('_', ' ')}",
+        request_id=request["id"] if request else None,
+        next_action="Review broker response" if status == "awaiting_feedback" else "",
+    )
+    if request:
+        request_status = {
+            "not_started": "prepared", "queued": "prepared", "in_progress": "prepared",
+            "awaiting_feedback": "waiting", "action_required": "verification_due",
+            "completed": "removed", "failed": "failed", "not_applicable": "not_found",
+        }[status]
+        with db() as conn:
+            conn.execute(
+                "UPDATE requests SET status=?,last_checked_at=? WHERE id=?",
+                (request_status, utcnow(), request["id"]),
+            )
+    audit("coverage_status_updated", f"{row['legal_name']} marked {status}")
+    return RedirectResponse("/coverage", status_code=303)
 
 
 @app.get("/welcome", response_class=HTMLResponse)
@@ -481,6 +812,9 @@ def save_welcome(
 def task(request: Request, task_id: int):
     with db() as conn:
         row = conn.execute("SELECT * FROM requests WHERE id=?", (task_id,)).fetchone()
+        automation_row = conn.execute(
+            "SELECT * FROM broker_automation WHERE broker_slug=?", (row["broker_slug"],)
+        ).fetchone() if row else None
     if not row:
         raise HTTPException(404, "Task not found")
     return templates.TemplateResponse(
@@ -489,6 +823,7 @@ def task(request: Request, task_id: int):
             "identity_variants": get_identity_variants(),
             "evidence": get_evidence(task_id),
             "transactions": get_submission_transactions(task_id),
+            "automation": dict(automation_row) if automation_row else None,
         }
     )
 
@@ -499,15 +834,25 @@ def submitted(task_id: int, confirmation: str = Form("")):
         row = conn.execute("SELECT * FROM requests WHERE id=?", (task_id,)).fetchone()
         if not row:
             raise HTTPException(404, "Task not found")
-        broker = broker_by_slug(row["broker_slug"])
+        try:
+            broker = broker_by_slug(row["broker_slug"])
+        except StopIteration:
+            broker = None
         submitted_on = date.today()
-        due = submitted_on + timedelta(days=int(broker["days"]))
+        due = submitted_on + timedelta(days=int(broker["days"]) if broker else 45)
         verify = due + timedelta(days=7)
         conn.execute(
             """UPDATE requests SET status='waiting',submitted_at=?,due_at=?,verify_at=?,confirmation=?,
             confirmation_status='awaiting_email'
             WHERE id=?""",
             (utcnow(), due.isoformat(), verify.isoformat(), confirmation.strip(), task_id),
+        )
+        registry_id = row["registry_id"]
+    if registry_id:
+        record_coverage_interaction(
+            registry_id, "awaiting_feedback", "Official deletion request submitted",
+            request_id=task_id, automated=True,
+            next_action=f"Await broker response by {due.isoformat()}",
         )
     audit("request_submitted", f"{row['broker_name']} marked submitted")
     return RedirectResponse("/", status_code=303)
@@ -684,7 +1029,84 @@ def api_next(token: str):
         raise HTTPException(401, "Pairing token required")
     refresh_due_statuses()
     next_task = next((r for r in get_requests() if r["status"] in {"prepared", "verification_due"}), None)
+    if next_task:
+        adapter = adapter_for(next_task["broker_slug"], next_task["url"])
+        with db() as conn:
+            control = conn.execute(
+                "SELECT * FROM broker_automation WHERE broker_slug=?", (next_task["broker_slug"],)
+            ).fetchone()
+        next_task = {**next_task, "adapter": {
+            "version": adapter.version, "level": adapter.level,
+            "domains": adapter.domains, "field_aliases": adapter.field_aliases,
+            "success_markers": adapter.success_markers,
+            "completion_markers": adapter.completion_markers,
+            "failure_markers": adapter.failure_markers,
+            "minimum_match": adapter.minimum_match,
+        }, "policy": setting("authorization_policy") or "ask",
+        "authorized": bool(control and control["authorized"])}
     return {"task": next_task}
+
+
+@app.post("/api/task/{task_id}/evaluate")
+def api_evaluate_match(task_id: int, payload: dict[str, Any], token: str):
+    require_extension_token(token)
+    with db() as conn:
+        row = conn.execute("SELECT * FROM requests WHERE id=?", (task_id,)).fetchone()
+        control = conn.execute(
+            "SELECT * FROM broker_automation WHERE broker_slug=?", (row["broker_slug"],)
+        ).fetchone() if row else None
+    if not row:
+        raise HTTPException(404, "Task not found")
+    result = match_identity(str(payload.get("visible_text", ""))[:500_000], profile() or {}, get_identity_variants())
+    adapter = adapter_for(row["broker_slug"], row["url"])
+    allowed, reason = may_submit(
+        setting("authorization_policy") or "ask", result["score"], result["strong_identifier"],
+        adapter, bool(control and control["authorized"]),
+    )
+    record_submission_transaction(
+        task_id, "matching", "matched" if result["score"] else "no_match",
+        match_score=result["score"], detail=f"Local match evaluated from {len(result['signals'])} signal(s)",
+        automated=True,
+    )
+    return {**result, "may_submit": allowed, "reason": reason, "adapter_level": adapter.level}
+
+
+@app.post("/api/task/{task_id}/verify-page")
+def api_verify_page(task_id: int, payload: dict[str, Any], token: str):
+    require_extension_token(token)
+    with db() as conn:
+        row = conn.execute("SELECT broker_slug,url FROM requests WHERE id=?", (task_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Task not found")
+    outcome = classify_confirmation_page(str(payload.get("visible_text", ""))[:500_000], adapter_for(row["broker_slug"], row["url"]))
+    mapped = {"accepted": "confirmed", "completed": "confirmed", "failed": "failed", "inconclusive": "needs_review"}[outcome]
+    record_submission_transaction(task_id, "confirmation", mapped, page_url=str(payload.get("page_url", "")), detail=f"Result page classified as {outcome}", automated=True)
+    if outcome in {"accepted", "completed"}:
+        submitted(task_id, str(payload.get("confirmation", "")))
+    return {"outcome": outcome}
+
+
+@app.post("/api/mail/receipt")
+def api_mail_receipt(payload: dict[str, Any], token: str):
+    require_extension_token(token)
+    subject, body, sender = (str(payload.get(key, "")) for key in ("subject", "body", "sender"))
+    fingerprint = message_fingerprint(str(payload.get("message_id", "")), subject, sender)
+    kind = classify_mail(subject, body)
+    request_id = payload.get("request_id")
+    with db() as conn:
+        if request_id and not conn.execute("SELECT 1 FROM requests WHERE id=?", (request_id,)).fetchone():
+            raise HTTPException(404, "Task not found")
+        cur = conn.execute(
+            """INSERT OR IGNORE INTO mail_receipts
+            (fingerprint,request_id,received_at,sender,subject,kind,action_url,processed_at)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (fingerprint, request_id, str(payload.get("received_at", utcnow())), encrypt(sender[:500]),
+             encrypt(subject[:1000]), kind, encrypt(str(payload.get("action_url", ""))[:2000]), utcnow()),
+        )
+    if cur.rowcount and request_id:
+        outcome = "failed" if kind == "denied" else "confirmed" if kind in {"accepted", "completed"} else "needs_review"
+        record_submission_transaction(request_id, "confirmation", outcome, detail=f"Local mailbox classified a {kind} message", automated=True)
+    return {"created": bool(cur.rowcount), "kind": kind}
 
 
 def require_extension_token(token: str) -> None:
@@ -710,6 +1132,47 @@ def api_submission_transaction(task_id: int, payload: dict[str, Any], token: str
     if payload.get("outcome") == "submitted":
         submitted(task_id, str(payload.get("confirmation", "")))
     return {"ok": True}
+
+
+@app.post("/api/task/{task_id}/evidence-capture")
+def api_evidence_capture(task_id: int, payload: dict[str, Any], token: str):
+    require_extension_token(token)
+    try:
+        content = base64.b64decode(str(payload.get("data", "")), validate=True)
+    except (ValueError, base64.binascii.Error):
+        raise HTTPException(400, "Evidence must be valid base64")
+    if not content or len(content) > 5 * 1024 * 1024:
+        raise HTTPException(400, "Captured evidence must be between 1 byte and 5 MB")
+    with db() as conn:
+        row = conn.execute("SELECT broker_name FROM requests WHERE id=?", (task_id,)).fetchone()
+        if not row:
+            raise HTTPException(404, "Task not found")
+    stored_name = f"{uuid.uuid4().hex}.vault"
+    EVIDENCE_DIR.mkdir(parents=True, exist_ok=True)
+    (EVIDENCE_DIR / stored_name).write_bytes(Fernet(key()).encrypt(content))
+    filename = str(payload.get("filename", "automation-evidence.png"))[:200]
+    with db() as conn:
+        conn.execute(
+            """INSERT INTO evidence
+            (request_id,filename,stored_name,content_type,size,note,created_at)
+            VALUES(?,?,?,?,?,?,?)""",
+            (task_id, encrypt(filename), stored_name, str(payload.get("content_type", "image/png"))[:100],
+             len(content), encrypt("Automatically captured submission evidence"), utcnow()),
+        )
+    audit("evidence_captured", f"Encrypted automation evidence captured for {row['broker_name']}")
+    return {"ok": True}
+
+
+@app.get("/api/automation/queue")
+def api_automation_queue(token: str):
+    require_extension_token(token)
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT q.id queue_id,q.reason,q.attempts,r.* FROM runner_queue q
+            JOIN requests r ON r.id=q.request_id WHERE q.status='queued'
+            ORDER BY q.run_after,q.id LIMIT 25"""
+        ).fetchall()
+    return {"tasks": [dict(row) for row in rows]}
 
 
 @app.post("/api/task/{task_id}/submitted")
