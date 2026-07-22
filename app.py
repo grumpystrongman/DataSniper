@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 import os
+import re
 import secrets
 import sqlite3
 import uuid
@@ -15,7 +16,7 @@ from urllib.parse import urlencode, urlsplit
 
 from cryptography.fernet import Fernet
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import HTMLResponse, RedirectResponse, Response
+from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from broker_catalog import BROKERS, CATALOG_VERSION, broker_by_slug
@@ -209,6 +210,19 @@ def init_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_submission_request
             ON submission_transactions(request_id, id DESC);
+            CREATE TABLE IF NOT EXISTS failure_diagnostics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                request_id INTEGER NOT NULL REFERENCES requests(id) ON DELETE CASCADE,
+                queue_id INTEGER REFERENCES runner_queue(id) ON DELETE SET NULL,
+                captured_at TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                outcome TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                page_url TEXT NOT NULL DEFAULT '',
+                observation TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_failure_diagnostics_request
+            ON failure_diagnostics(request_id, id DESC);
             CREATE TABLE IF NOT EXISTS broker_automation (
                 broker_slug TEXT PRIMARY KEY,
                 adapter_version INTEGER NOT NULL,
@@ -239,6 +253,7 @@ def init_db() -> None:
                 run_after TEXT NOT NULL,
                 status TEXT NOT NULL DEFAULT 'queued',
                 reason TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 worker_id TEXT,
                 stage TEXT NOT NULL DEFAULT 'scheduled',
@@ -273,6 +288,7 @@ def init_db() -> None:
                 conn.execute(f"ALTER TABLE broker_registry ADD COLUMN {name} {definition}")
         queue_columns = {row["name"] for row in conn.execute("PRAGMA table_info(runner_queue)")}
         queue_migrations = {
+            "priority": "INTEGER NOT NULL DEFAULT 0",
             "worker_id": "TEXT", "stage": "TEXT NOT NULL DEFAULT 'scheduled'",
             "started_at": "TEXT", "heartbeat_at": "TEXT", "finished_at": "TEXT",
             "last_error": "TEXT NOT NULL DEFAULT ''",
@@ -299,6 +315,7 @@ def init_db() -> None:
                     run_after TEXT NOT NULL,
                     status TEXT NOT NULL DEFAULT 'queued',
                     reason TEXT NOT NULL,
+                    priority INTEGER NOT NULL DEFAULT 0,
                     attempts INTEGER NOT NULL DEFAULT 0,
                     worker_id TEXT,
                     stage TEXT NOT NULL DEFAULT 'scheduled',
@@ -308,7 +325,7 @@ def init_db() -> None:
                     last_error TEXT NOT NULL DEFAULT ''
                 );
                 INSERT INTO runner_queue_v2
-                SELECT id,request_id,created_at,run_after,status,reason,attempts,
+                SELECT id,request_id,created_at,run_after,status,reason,priority,attempts,
                        worker_id,stage,started_at,heartbeat_at,finished_at,last_error
                 FROM runner_queue;
                 DROP TABLE runner_queue;
@@ -395,6 +412,64 @@ def get_submission_transactions(request_id: int | None = None) -> list[dict[str,
     return result
 
 
+def record_failure_diagnostic(request_id: int, queue_id: int | None, stage: str, outcome: str,
+                              reason: str, page_url: str, observation: dict[str, Any]) -> None:
+    """Persist a redacted page observation without retaining entered identity values."""
+    safe = {
+        "page_title": str(observation.get("page_title", ""))[:300],
+        "headings": [str(value)[:180] for value in observation.get("headings", [])[:25]],
+        "controls": [],
+        "detected": observation.get("detected", {}),
+        "attempted": observation.get("attempted", {}),
+    }
+    for control in observation.get("controls", [])[:100]:
+        safe["controls"].append({
+            "index": int(control.get("index", 0)),
+            "type": str(control.get("type", ""))[:40],
+            "label": str(control.get("label", ""))[:180],
+            "required": bool(control.get("required")),
+            "options": [str(value)[:120] for value in control.get("options", [])[:30]],
+        })
+    with db() as conn:
+        if not conn.execute("SELECT 1 FROM requests WHERE id=?", (request_id,)).fetchone():
+            raise LookupError("Request not found")
+        conn.execute(
+            """INSERT INTO failure_diagnostics
+            (request_id,queue_id,captured_at,stage,outcome,reason,page_url,observation)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            (request_id, queue_id, utcnow(), stage[:80], outcome[:40], reason[:2000],
+             encrypt(page_url[:2000]) if page_url else "", encrypt(json.dumps(safe, ensure_ascii=False))),
+        )
+
+
+def get_failure_diagnostics(limit: int = 500) -> list[dict[str, Any]]:
+    with db() as conn:
+        rows = conn.execute(
+            """SELECT d.*,r.broker_name,r.broker_slug FROM failure_diagnostics d
+            JOIN requests r ON r.id=d.request_id ORDER BY d.id DESC LIMIT ?""", (limit,)
+        ).fetchall()
+    result = []
+    for row in rows:
+        item = dict(row)
+        item["page_url"] = decrypt(item["page_url"])
+        item["observation"] = json.loads(decrypt(item["observation"]))
+        result.append(item)
+    return result
+
+
+def failure_diagnostic_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    groups: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        normalized = re.sub(r"\b\d+\b", "#", row["reason"].casefold())
+        normalized = re.sub(r"\s+", " ", normalized).strip()[:240]
+        key = (row["stage"], normalized)
+        group = groups.setdefault(key, {"stage": row["stage"], "reason": row["reason"], "count": 0, "brokers": []})
+        group["count"] += 1
+        if row["broker_name"] not in group["brokers"]:
+            group["brokers"].append(row["broker_name"])
+    return sorted(groups.values(), key=lambda item: (-item["count"], item["stage"], item["reason"]))
+
+
 def automation_overview() -> dict[str, Any]:
     with db() as conn:
         rows = conn.execute(
@@ -404,9 +479,19 @@ def automation_overview() -> dict[str, Any]:
         ).fetchall()
         queue_rows = conn.execute(
             """SELECT q.*,r.broker_name FROM runner_queue q JOIN requests r ON r.id=q.request_id
-            WHERE q.status IN ('queued','running','attention','failed','completed') ORDER BY q.id DESC LIMIT 200"""
+            WHERE q.status='running'
+               OR q.id IN (SELECT id FROM runner_queue WHERE status!='running'
+                           ORDER BY priority DESC,id DESC LIMIT 200)
+            ORDER BY CASE WHEN q.status='running' THEN 0 ELSE 1 END,q.id DESC LIMIT 250"""
         ).fetchall()
-        queue = sum(row["status"] == "queued" for row in queue_rows)
+        now = utcnow()
+        queue_stats = conn.execute(
+            """SELECT COUNT(*) queued,
+               SUM(CASE WHEN run_after <= ? THEN 1 ELSE 0 END) due,
+               SUM(CASE WHEN run_after > ? THEN 1 ELSE 0 END) deferred
+               FROM runner_queue WHERE status='queued'""", (now, now)
+        ).fetchone()
+        queue = queue_stats["queued"] or 0
     items = []
     for row in rows:
         item = dict(row)
@@ -457,6 +542,8 @@ def automation_overview() -> dict[str, Any]:
     return {
         "items": items,
         "queue": queue,
+        "queue_due": queue_stats["due"] or 0,
+        "queue_deferred": queue_stats["deferred"] or 0,
         "full": sum(item["support_level"] == "full" for item in items),
         "assisted": sum(item["support_level"] == "assisted" for item in items),
         "manual": sum(item["support_level"] == "manual" for item in items),
@@ -782,11 +869,56 @@ def home(request: Request):
 
 @app.get("/automation", response_class=HTMLResponse)
 def automation_center(request: Request):
+    diagnostics = get_failure_diagnostics()
     return templates.TemplateResponse(request, "automation.html", {
         "overview": automation_overview(),
         "policy": setting("authorization_policy") or "ask",
         "mail_configured": bool(os.environ.get("DATASNIPER_IMAP_HOST", "").strip()),
+        "diagnostics": diagnostics,
+        "diagnostic_summary": failure_diagnostic_summary(diagnostics),
     })
+
+
+@app.get("/automation/failure-report", response_class=PlainTextResponse)
+def export_failure_report():
+    rows = get_failure_diagnostics()
+    summary = failure_diagnostic_summary(rows)
+    lines = [
+        "# DataSniper Automation Failure Report", "",
+        f"Generated: {utcnow()}", f"Captured failures: {len(rows)}", "",
+        "This report excludes entered identity values. It describes page structure, visible control labels,",
+        "choices, attempted actions, and recorded blockers for troubleshooting.", "",
+        "## Recurring patterns", "",
+    ]
+    if not summary:
+        lines.append("No structured failure diagnostics have been captured yet.")
+    for group in summary:
+        lines.extend([
+            f"- **{group['count']} occurrence(s) · {group['stage']}** — {group['reason']}",
+            f"  Brokers: {', '.join(group['brokers'])}",
+        ])
+    for row in rows:
+        observed = row["observation"]
+        lines.extend([
+            "", f"## {row['broker_name']} — diagnostic #{row['id']}", "",
+            f"- Captured: {row['captured_at']}", f"- Stage/outcome: {row['stage']} / {row['outcome']}",
+            f"- Reason: {row['reason']}", f"- Page: {row['page_url'] or 'not available'}",
+            f"- Page title: {observed.get('page_title') or 'not available'}",
+            f"- Headings/prompts: {' | '.join(observed.get('headings', [])) or 'none captured'}",
+            f"- Detected blockers: `{json.dumps(observed.get('detected', {}), ensure_ascii=False)}`",
+            f"- Attempted action: `{json.dumps(observed.get('attempted', {}), ensure_ascii=False)}`",
+            "", "### Controls observed", "",
+        ])
+        controls = observed.get("controls", [])
+        if not controls:
+            lines.append("No page controls were captured (the failure may have occurred before page inspection).")
+        for control in controls:
+            options = f"; choices: {', '.join(control.get('options', []))}" if control.get("options") else ""
+            required = "; required" if control.get("required") else ""
+            lines.append(f"- {control.get('type', 'control')}: {control.get('label') or '(unlabeled)'}{required}{options}")
+    filename = f"datasniper-failure-report-{date.today().isoformat()}.md"
+    return PlainTextResponse("\n".join(lines) + "\n", media_type="text/markdown",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @app.get("/automation/status")
@@ -842,15 +974,15 @@ def requeue_automation_request(request_id: int, *, allow_terminal: bool = False)
         now = utcnow()
         if queue_row:
             conn.execute(
-                """UPDATE runner_queue SET status='queued',stage='scheduled',created_at=?,run_after=?,reason=?,
+                """UPDATE runner_queue SET status='queued',stage='scheduled',created_at=?,run_after=?,reason=?,priority=100,
                 attempts=0,worker_id=NULL,started_at=NULL,heartbeat_at=NULL,finished_at=NULL,last_error=''
                 WHERE id=?""",
                 (now, now, "Explicit operator rerun", queue_row["id"]),
             )
         else:
             conn.execute(
-                """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason)
-                VALUES(?,?,?,'queued','Explicit operator run')""", (request_id, now, now),
+                """INSERT INTO runner_queue(request_id,created_at,run_after,status,reason,priority)
+                VALUES(?,?,?,'queued','Explicit operator run',100)""", (request_id, now, now),
             )
         conn.execute("UPDATE requests SET automation_status='queued' WHERE id=?", (request_id,))
     record_submission_transaction(
