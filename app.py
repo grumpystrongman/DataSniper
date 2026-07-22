@@ -69,8 +69,12 @@ def decrypt(value: str | None) -> str:
 
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH)
+    # The HTTP handlers, monitor, and browser worker use separate threads.  Give
+    # short-lived writes time to finish instead of letting a worker thread die
+    # during its first status update with ``database is locked``.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA busy_timeout=30000")
     try:
         yield conn
         conn.commit()
@@ -368,6 +372,15 @@ def automation_overview() -> dict[str, Any]:
             heartbeat_fresh = datetime.fromisoformat(heartbeat.replace("Z", "+00:00")) >= datetime.now().astimezone() - timedelta(seconds=30)
         except ValueError:
             pass
+    transition_at = setting("browser_worker_transition_at") or ""
+    phase_age_seconds = None
+    if transition_at:
+        try:
+            phase_age_seconds = max(0, int(
+                (datetime.now().astimezone() - datetime.fromisoformat(transition_at.replace("Z", "+00:00"))).total_seconds()
+            ))
+        except ValueError:
+            pass
     latest_queue = {}
     for row in queue_rows:
         latest_queue.setdefault(row["request_id"], dict(row))
@@ -404,7 +417,8 @@ def automation_overview() -> dict[str, Any]:
             "heartbeat": heartbeat,
             "detail": setting("browser_worker_detail") or "",
             "state": setting("browser_worker_state") or "offline",
-            "transition_at": setting("browser_worker_transition_at") or "",
+            "transition_at": transition_at,
+            "phase_age_seconds": phase_age_seconds,
         },
         "activity": [dict(row) for row in queue_rows],
         "groups": groups,

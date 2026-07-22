@@ -25,7 +25,7 @@
     <form method="post" action="/automation/worker/start"><button class="success" type="submit">Start worker</button></form>
     <form method="post" action="/automation/worker/restart"><button type="submit">Restart worker</button></form>
     <form method="post" action="/automation/worker/stop"><button class="secondary" type="submit">Stop safely</button></form>
-    <span class="muted">Service state: <strong id="worker-state">{{ overview.worker.state.replace('_',' ') }}</strong> · checked <span id="worker-checked">now</span></span>
+    <span class="muted">Service state: <strong id="worker-state">{{ overview.worker.state.replace('_',' ') }}</strong> · <span id="worker-elapsed">{% if overview.worker.phase_age_seconds is not none %}{{ overview.worker.phase_age_seconds }}s in this phase · {% endif %}</span>checked <span id="worker-checked">now</span></span>
   </div>
   <div class="grid">
     <div><div class="metric">{{ overview.full }}</div><div class="muted">fully automated</div></div>
@@ -161,6 +161,7 @@
   const health=document.querySelector('#worker-health');
   const state=document.querySelector('#worker-state');
   const checked=document.querySelector('#worker-checked');
+  const elapsed=document.querySelector('#worker-elapsed');
   const liveJobs=document.querySelector('#live-jobs');
   const escapeText=value=>String(value??'');
   const renderJobs=jobs=>{
@@ -191,6 +192,7 @@
       const data=await response.json();
       state.textContent=(data.worker.state||'unknown').replaceAll('_',' ');
       checked.textContent=new Date().toLocaleTimeString();
+      elapsed.textContent=data.worker.phase_age_seconds==null?'':`${data.worker.phase_age_seconds}s in this phase · `;
       health.dataset.state=data.worker.state||'unknown';
       if(data.worker.online){
         renderHealth('Background browser worker online.',` ${data.running} running · ${data.queue} queued${data.worker.heartbeat?` · heartbeat ${data.worker.heartbeat}`:''}.`,true);
