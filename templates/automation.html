@@ -26,7 +26,7 @@
     <strong>Private local AI:</strong>
     <span id="intelligence-detail">{{ overview.intelligence.detail }}</span>.
     <span class="muted">Model: <code id="intelligence-model">{{ overview.intelligence.model }}</code> ·
-    <span id="intelligence-state">{{ 'loaded' if overview.intelligence.loaded else ('ready (loads when needed)' if overview.intelligence.installed else 'unavailable') }}</span></span>
+    <span id="intelligence-state">{{ 'installing' if overview.intelligence.provisioning.state == 'installing' else ('loaded' if overview.intelligence.loaded else ('ready (loads when needed)' if overview.intelligence.installed else 'unavailable')) }}</span></span>
   </div>
   <div class="actions" style="margin-top:16px">
     <form method="post" action="/automation/worker/start"><button class="success" type="submit">Start worker</button></form>
@@ -233,8 +233,9 @@
       const intelligence=data.intelligence||{};
       intelligenceDetail.textContent=intelligence.detail||'Status unavailable';
       intelligenceModel.textContent=intelligence.model||'not configured';
-      intelligenceState.textContent=intelligence.loaded?'loaded':(intelligence.installed?'ready (loads when needed)':'unavailable');
-      intelligenceHealth.className=intelligence.installed?'good':'notice';
+      const provisioning=intelligence.provisioning||{};
+      intelligenceState.textContent=provisioning.state==='installing'?'installing':(intelligence.loaded?'loaded':(intelligence.installed?'ready (loads when needed)':'unavailable'));
+      intelligenceHealth.className=intelligence.installed?'good':(provisioning.state==='installing'?'notice':'notice');
       state.textContent=(data.worker.state||'unknown').replaceAll('_',' ');
       checked.textContent=new Date().toLocaleTimeString();
       elapsed.textContent=data.worker.phase_age_seconds==null?'':`${data.worker.phase_age_seconds}s in this phase · `;
