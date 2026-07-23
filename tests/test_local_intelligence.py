@@ -1,9 +1,11 @@
 import io
 import json
+import threading
 from unittest.mock import patch
 
 import pytest
 
+import local_intelligence
 from local_intelligence import LocalIntelligence
 
 
@@ -86,3 +88,41 @@ def test_evaluator_rejects_unapproved_action():
     })}}
     with patch("urllib.request.urlopen", return_value=Response(answer)):
         assert LocalIntelligence().evaluate(url="https://x.test", title="", headings=[], controls=[]) is None
+
+
+def test_missing_model_is_provisioned_once_in_background():
+    intelligence = LocalIntelligence()
+    local_intelligence._provision_state.update(
+        {"state": "idle", "detail": "", "started_at": None, "finished_at": None}
+    )
+    missing = {
+        "available": True, "installed": False, "loaded": False, "responding": False,
+        "model": intelligence.model, "endpoint": intelligence.endpoint, "detail": "missing",
+        "provisioning": {},
+    }
+    gate = threading.Event()
+    with patch.object(intelligence, "status", return_value=missing), \
+         patch.object(intelligence, "_provision_model", side_effect=lambda: gate.wait(1)) as provision:
+        assert intelligence.ensure_model_async() is True
+        assert intelligence.ensure_model_async() is False
+        assert local_intelligence._provision_state["state"] == "installing"
+        gate.set()
+    provision.assert_called_once()
+
+
+def test_model_provisioner_uses_exact_pinned_tag_and_smoke_tests():
+    intelligence = LocalIntelligence()
+    local_intelligence._provision_state["state"] = "installing"
+    captured = {}
+
+    def open_request(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return Response({"status": "success"})
+
+    verified = {"installed": True, "responding": True}
+    with patch("urllib.request.urlopen", open_request), \
+         patch.object(intelligence, "status", return_value=verified) as status:
+        intelligence._provision_model()
+    assert captured["body"] == {"name": "qwen3-vl:4b-instruct-q4_K_M", "stream": False}
+    status.assert_called_once_with(timeout=5, verify_inference=True)
+    assert local_intelligence._provision_state["state"] == "ready"
