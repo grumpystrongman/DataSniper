@@ -155,11 +155,17 @@ class QueueStore:
             )
 
     def finish(self, job: dict[str, Any], result: BrowserResult) -> None:
-        permanent_url_failure = bool(re.search(r"HTTP (404|410)\b", result.detail)) or (
-            job.get("attempts", 0) + 1 >= 3
-            and bool(re.search(r"ERR_NAME_NOT_RESOLVED|ERR_CONNECTION_REFUSED", result.detail))
-        )
         attempt_number = job.get("attempts", 0) + 1
+        immediately_unaddressable = result.outcome == "unavailable" or bool(re.search(
+            r"HTTP (404|410)\b|ERR_NAME_NOT_RESOLVED|ERR_INVALID_URL|"
+            r"ERR_ADDRESS_INVALID|ERR_UNKNOWN_URL_SCHEME",
+            result.detail,
+            re.IGNORECASE,
+        ))
+        permanent_url_failure = immediately_unaddressable or (
+            attempt_number >= 3
+            and bool(re.search(r"ERR_CONNECTION_REFUSED", result.detail, re.IGNORECASE))
+        )
         transient_failure = bool(re.search(
             r"HTTP 5\d\d|timeout|timed out|ERR_CONNECTION_(?:RESET|CLOSED|TIMED_OUT)|"
             r"temporar|network|connection reset",
@@ -182,6 +188,7 @@ class QueueStore:
         status = {
             "submitted": "awaiting_response", "confirmed": "completed", "blocked": "human_action_required",
             "needs_review": "human_action_required", "failed": "failed", "no_match": "not_applicable",
+            "unavailable": "not_applicable",
         }.get(result.outcome, result.outcome)
         if permanent_url_failure:
             status = "not_applicable"
@@ -200,8 +207,8 @@ class QueueStore:
                 WHERE id=? AND worker_id=?""",
                 (queue_state, "archived" if permanent_url_failure else ("retry_scheduled" if retryable_failure else result.stage),
                  None if retryable_failure else now, now,
-                 (("Archived: official URL is unavailable after repeated checks — " if permanent_url_failure else "") + result.detail)[:1000]
-                 if queue_state != "completed" else "", retry_at if retryable_failure else now,
+                 ((("Archived: Not addressed because official URL is unavailable — " if permanent_url_failure else "") + result.detail)[:1000]
+                  if queue_state != "completed" else ""), retry_at if retryable_failure else now,
                  None if retryable_failure else self.worker_id, job["queue_id"], self.worker_id),
             )
             if permanent_url_failure:
