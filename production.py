@@ -39,6 +39,7 @@ from app import (
 from automation import adapter_for
 from automation import classify_mail, message_fingerprint
 from broker_catalog import BROKERS, CATALOG_VERSION
+from operational_log import LOG_PATH, configure_logging, event as log_event
 
 ROOT = Path(__file__).resolve().parent
 ADMIN_FILE = DATA_DIR / ".admin.json"
@@ -49,6 +50,7 @@ PUBLIC_PATHS = {"/health", "/login", "/setup-admin", "/extension/pair", "/extens
 MAX_FAILURES = 8
 WINDOW_SECONDS = 15 * 60
 failures: dict[str, deque[float]] = defaultdict(deque)
+configure_logging()
 
 
 def now_iso() -> str:
@@ -139,7 +141,15 @@ class SecurityMiddleware(BaseHTTPMiddleware):
         if admin and path not in PUBLIC_PATHS and not path.startswith("/static") and not authenticated:
             return RedirectResponse(f"/login?next={path}", status_code=303)
 
-        response = await call_next(request)
+        started = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            log_event("http_error", f"{request.method} {request.url.path} {type(exc).__name__}")
+            raise
+        elapsed_ms = int((time.monotonic() - started) * 1000)
+        if request.url.path not in {"/automation/status", "/health"}:
+            log_event("http", f"{request.method} {request.url.path} {response.status_code} {elapsed_ms}ms")
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "no-referrer"

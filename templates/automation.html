@@ -3,6 +3,7 @@
 <div class="card">
   <h1>Automation Center</h1>
   <p class="muted">DataSniper runs supported privacy work and leaves only identity checks, CAPTCHAs, legal attestations, and ambiguous matches for you.</p>
+  <p><a href="/automation/logs/download">Download privacy-safe support log</a></p>
   {% if request.query_params.get('control_state') %}
   <div class="{{ 'good' if request.query_params.get('control_state') == 'online' else 'notice' }}" role="status" aria-live="polite">
     <strong>{{ request.query_params.get('control_action')|title }} request received:</strong>
@@ -20,6 +21,12 @@
   {% else %}
   <strong>Browser worker auto-start is disabled.</strong> Start it below for this session, or set <code>DATASNIPER_BROWSER_WORKER=1</code> to start it whenever DataSniper launches.<span id="worker-detail" hidden></span>
   {% endif %}
+  </div>
+  <div id="intelligence-health" class="{{ 'good' if overview.intelligence.installed else 'notice' }}" role="status" aria-live="polite">
+    <strong>Private local AI:</strong>
+    <span id="intelligence-detail">{{ overview.intelligence.detail }}</span>.
+    <span class="muted">Model: <code id="intelligence-model">{{ overview.intelligence.model }}</code> ·
+    <span id="intelligence-state">{{ 'loaded' if overview.intelligence.loaded else ('ready (loads when needed)' if overview.intelligence.installed else 'unavailable') }}</span></span>
   </div>
   <div class="actions" style="margin-top:16px">
     <form method="post" action="/automation/worker/start"><button class="success" type="submit">Start worker</button></form>
@@ -188,6 +195,10 @@
     }
   });
   const health=document.querySelector('#worker-health');
+  const intelligenceHealth=document.querySelector('#intelligence-health');
+  const intelligenceDetail=document.querySelector('#intelligence-detail');
+  const intelligenceModel=document.querySelector('#intelligence-model');
+  const intelligenceState=document.querySelector('#intelligence-state');
   const state=document.querySelector('#worker-state');
   const checked=document.querySelector('#worker-checked');
   const elapsed=document.querySelector('#worker-elapsed');
@@ -219,6 +230,11 @@
       const response=await fetch('/automation/status',{headers:{Accept:'application/json'},cache:'no-store'});
       if(!response.ok)throw new Error(`status ${response.status}`);
       const data=await response.json();
+      const intelligence=data.intelligence||{};
+      intelligenceDetail.textContent=intelligence.detail||'Status unavailable';
+      intelligenceModel.textContent=intelligence.model||'not configured';
+      intelligenceState.textContent=intelligence.loaded?'loaded':(intelligence.installed?'ready (loads when needed)':'unavailable');
+      intelligenceHealth.className=intelligence.installed?'good':'notice';
       state.textContent=(data.worker.state||'unknown').replaceAll('_',' ');
       checked.textContent=new Date().toLocaleTimeString();
       elapsed.textContent=data.worker.phase_age_seconds==null?'':`${data.worker.phase_age_seconds}s in this phase · `;

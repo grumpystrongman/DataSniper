@@ -495,6 +495,42 @@ def test_worker_supervisor_restarts_without_parallel_workers():
     supervisor.shutdown()
 
 
+def test_worker_restart_timeout_reports_failure_without_parallel_worker(monkeypatch):
+    workers = []
+
+    class FakeWorker:
+        def __init__(self):
+            import threading
+            self.stop_event = threading.Event()
+            self.wake_event = threading.Event()
+            self.statuses = []
+            self.audits = []
+            self.store = type("Store", (), {
+                "worker_status": lambda inner, state, detail="": self.statuses.append((state, detail)),
+            })()
+            self.audit_fn = lambda event, detail: self.audits.append((event, detail))
+            workers.append(self)
+
+        def run_forever(self):
+            import time
+            time.sleep(0.5)
+
+        def wake(self):
+            self.wake_event.set()
+
+    monkeypatch.setenv("DATASNIPER_BROWSER_RESTART_TIMEOUT", "0.1")
+    supervisor = WorkerSupervisor(FakeWorker)
+    assert supervisor.start()["state"] == "starting"
+    assert supervisor.restart()["state"] == "restarting"
+    supervisor._restart_thread.join(timeout=1)
+    assert len(workers) == 1
+    assert any(
+        state == "failed" and "duplicate submission" in detail
+        for state, detail in workers[0].statuses
+    )
+    supervisor.shutdown(timeout=1)
+
+
 def test_worker_control_posts_through_production_and_reports_result(tmp_path, monkeypatch):
     """Regression: rendered controls must cause an observable production HTTP state change."""
     from fastapi.testclient import TestClient

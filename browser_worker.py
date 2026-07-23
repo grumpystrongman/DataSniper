@@ -18,6 +18,7 @@ from typing import Any, Callable
 from urllib.parse import urlsplit
 
 from automation import adapter_for, classify_confirmation_page, match_identity, may_submit
+from local_intelligence import LocalIntelligence
 
 
 TERMINAL_QUEUE_STATES = {"completed", "attention", "failed", "cancelled"}
@@ -207,8 +208,9 @@ class QueueStore:
 class PlaywrightExecutor:
     """One persistent Chromium context; a fresh page is used for each broker."""
 
-    def __init__(self):
+    def __init__(self, intelligence: LocalIntelligence | None = None):
         self._playwright = self._browser = self._context = None
+        self.intelligence = intelligence or LocalIntelligence()
 
     def start(self) -> None:
         from playwright.sync_api import sync_playwright
@@ -305,6 +307,61 @@ class PlaywrightExecutor:
                     break
             assert result is not None
             diagnostics = result.get("diagnostics")
+            if result["outcome"] == "needs_review" and result["stage"] == "inspection" and self.intelligence.health():
+                snapshot = diagnostics or {}
+                proposal = self.intelligence.evaluate(
+                    url=page.url,
+                    title=str(snapshot.get("page_title", "")),
+                    headings=list(snapshot.get("headings", [])),
+                    controls=list(snapshot.get("controls", [])),
+                    screenshot=self._screenshot(page),
+                )
+                if proposal:
+                    snapshot["local_intelligence"] = {
+                        "page_type": proposal.page_type,
+                        "request_intent": proposal.request_intent,
+                        "next_action": proposal.next_action,
+                        "confidence": proposal.confidence,
+                        "field_mappings": list(proposal.field_mappings),
+                        "blockers": list(proposal.blockers),
+                        "explanation": proposal.explanation,
+                    }
+                    diagnostics = snapshot
+                    if proposal.next_action == "request_human_help" or proposal.blockers:
+                        result["detail"] = "Local intelligence found a step that needs your help"
+                    elif proposal.next_action == "fill_without_submitting" and proposal.confidence >= 0.97:
+                        controls = list(snapshot.get("controls", []))
+                        learned_aliases = {key: list(values) for key, values in adapter.field_aliases.items()}
+                        for mapping in proposal.field_mappings:
+                            if float(mapping.get("confidence", 0)) < 0.97:
+                                continue
+                            index = mapping.get("control_index")
+                            if not isinstance(index, int) or not (1 <= index <= len(controls)):
+                                continue
+                            label = str(controls[index - 1].get("label", "")).strip().lower()
+                            if label:
+                                learned_aliases.setdefault(mapping["profile_key"], []).append(label)
+                        relearned = page.evaluate(
+                            _FORM_SCRIPT,
+                            {"profile": supplied, "aliases": learned_aliases, "submit": False},
+                        )
+                        relearned_safe = bool(
+                            (relearned.get("diagnostics") or {}).get("detected", {}).get("safe_profile_form")
+                        )
+                        relearned_allowed, _ = may_submit(
+                            policy, decision["score"], decision["strong_identifier"], adapter,
+                            bool(job["authorized"]), safe_profile_form=relearned_safe,
+                        )
+                        if relearned_allowed and relearned.get("stage") == "authorization":
+                            result = page.evaluate(
+                                _FORM_SCRIPT,
+                                {"profile": supplied, "aliases": learned_aliases, "submit": True},
+                            )
+                            result["match_score"] = decision["score"]
+                            result.setdefault("diagnostics", {}).update(
+                                {"local_intelligence": snapshot["local_intelligence"]}
+                            )
+                            diagnostics = result["diagnostics"]
             if result["outcome"] in {"blocked", "needs_review", "advanced"}:
                 if result["outcome"] == "advanced":
                     result.update(outcome="needs_review", stage="inspection", detail="The form exceeded four automatic steps; review is required")
@@ -626,8 +683,24 @@ class WorkerSupervisor:
             return {"state": "restarting", "detail": "Worker will restart after its current attempt"}
 
     def _restart_after(self, previous: threading.Thread | None) -> None:
+        timeout = max(0.1, float(os.environ.get("DATASNIPER_BROWSER_RESTART_TIMEOUT", "90")))
         if previous:
-            previous.join()
+            previous.join(timeout=timeout)
+        if previous and previous.is_alive():
+            with self._lock:
+                worker = self._worker
+            detail = (
+                f"Restart timed out after {int(timeout)} seconds because the current browser "
+                "attempt did not stop. DataSniper did not start a second worker to prevent "
+                "a duplicate submission."
+            )
+            if worker:
+                try:
+                    worker.store.worker_status("failed", detail)
+                    worker.audit_fn("browser_worker_restart_timeout", detail)
+                except Exception:
+                    pass
+            return
         with self._lock:
             if not self._desired_running:
                 return

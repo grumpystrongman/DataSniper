@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, PlainTextResponse, RedirectResponse,
 from fastapi.templating import Jinja2Templates
 
 from broker_catalog import BROKERS, CATALOG_VERSION, broker_by_slug
+from operational_log import LOG_PATH
 from automation import (
     AUTHORIZATION_POLICIES, adapter_for, classify_confirmation_page,
     classify_mail, match_identity, may_submit, message_fingerprint, support_score,
@@ -602,6 +603,8 @@ def parent_status_model() -> dict[str, Any]:
 
 
 def automation_overview() -> dict[str, Any]:
+    from local_intelligence import LocalIntelligence
+
     with db() as conn:
         rows = conn.execute(
             """SELECT r.id,r.broker_slug,r.broker_name,r.status,r.automation_status,
@@ -689,6 +692,7 @@ def automation_overview() -> dict[str, Any]:
             "transition_at": transition_at,
             "phase_age_seconds": phase_age_seconds,
         },
+        "intelligence": LocalIntelligence().status(),
         "activity": [dict(row) for row in queue_rows],
         "groups": groups,
         "group_counts": {key: len(value) for key, value in groups.items()},
@@ -964,6 +968,8 @@ def audit(event_type: str, detail: str) -> None:
             "INSERT INTO audit(event_at,event_type,detail) VALUES(?,?,?)",
             (utcnow(), event_type, detail),
         )
+    from operational_log import event
+    event(event_type, detail)
 
 
 def build_plan(state: str) -> int:
@@ -1193,14 +1199,35 @@ def clear_failure_diagnostics(mode: str = Form("older")):
 def automation_status() -> dict[str, Any]:
     """Small live payload used by the operator console to verify real worker health."""
     overview = automation_overview()
+    with db() as conn:
+        unread = conn.execute("SELECT COUNT(*) FROM notifications WHERE read_at IS NULL").fetchone()[0]
+        latest = conn.execute(
+            """SELECT id,kind,title,detail,created_at FROM notifications
+            WHERE read_at IS NULL ORDER BY id DESC LIMIT 1"""
+        ).fetchone()
     return {
         "worker": overview["worker"],
+        "intelligence": overview["intelligence"],
+        "parent": overview["parent"]["overall"],
         "queue": overview["queue"],
         "running": overview["running"],
+        "unread_notifications": unread,
+        "latest_notification": dict(latest) if latest else None,
         "group_counts": overview["group_counts"],
         "activity": overview["activity"][:25],
         "checked_at": utcnow(),
     }
+
+
+@app.get("/automation/logs/download")
+def download_operational_log():
+    if not LOG_PATH.exists():
+        return PlainTextResponse("No operational activity has been logged yet.\n")
+    return PlainTextResponse(
+        LOG_PATH.read_text(encoding="utf-8", errors="replace"),
+        media_type="text/plain",
+        headers={"Content-Disposition": 'attachment; filename="datasniper-support.log"'},
+    )
 
 
 @app.post("/automation/worker/{action}")

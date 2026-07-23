@@ -1,7 +1,40 @@
 services:
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    volumes:
+      - ollama_models:/root/.ollama
+    networks:
+      - default
+      - local_intelligence
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+    security_opt:
+      - no-new-privileges:true
+
+  qwen_setup:
+    image: ollama/ollama:latest
+    restart: "no"
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+    command: ["pull", "${DATASNIPER_MODEL:-qwen3-vl:4b-instruct-q4_K_M}"]
+    depends_on:
+      ollama:
+        condition: service_healthy
+    networks:
+      - local_intelligence
+    security_opt:
+      - no-new-privileges:true
+
   datasniper:
     build: .
     restart: unless-stopped
+    depends_on:
+      qwen_setup:
+        condition: service_completed_successfully
     ports:
       - "127.0.0.1:8787:8787"
     environment:
@@ -11,6 +44,8 @@ services:
       DATASNIPER_ACCESS_LOG: "0"
       DATASNIPER_BROWSER_WORKER: "1"
       DATASNIPER_BROWSER_HEADLESS: "1"
+      DATASNIPER_MODEL: ${DATASNIPER_MODEL:-qwen3-vl:4b-instruct-q4_K_M}
+      DATASNIPER_MODEL_ENDPOINT: http://ollama:11434
       HIBP_API_KEY: ${HIBP_API_KEY:-}
     volumes:
       - ./data:/app/data
@@ -21,3 +56,13 @@ services:
       - no-new-privileges:true
     cap_drop:
       - ALL
+    networks:
+      - default
+      - local_intelligence
+
+volumes:
+  ollama_models:
+
+networks:
+  local_intelligence:
+    internal: true
