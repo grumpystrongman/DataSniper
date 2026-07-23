@@ -2,16 +2,16 @@
 
 _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
   const visible=(document.body?.innerText||'').toLowerCase();
-  const captcha=!!document.querySelector('iframe[src*="captcha" i],.g-recaptcha,[class*="captcha" i],[id*="captcha" i],[data-sitekey]')||/verify you are human|complete the captcha|security challenge/.test(visible);
+  const captcha=!!document.querySelector('iframe[src*="captcha" i],.g-recaptcha,[class*="captcha" i],[id*="captcha" i],[data-sitekey]')||/verify you are human|complete the captcha|security challenge|checking for any bots/.test(visible);
   const describe=e=>`${e.name||''} ${e.id||''} ${e.placeholder||''} ${e.getAttribute('aria-label')||''} ${e.labels?[...e.labels].map(x=>x.innerText).join(' '):''}`.toLowerCase();
   const allControls=[...document.querySelectorAll('input,textarea,select')].filter(e=>!e.disabled&&e.type!=='hidden');
   const forms=[...document.querySelectorAll('form')];
   const formScore=form=>{
     const candidates=allControls.filter(e=>e.form===form);
     const recognized=candidates.filter(e=>Object.values(aliases).flat().some(name=>describe(e).includes(name))).length;
-    const privacy=/delete|deletion|erase|erasure|remove|do not sell|opt.?out|privacy request|personal information/.test(`${form.innerText||''} ${form.action||''}`.toLowerCase());
+    const privacy=/delete|deletion|erase|erasure|remove|do not sell|do not share|opt.?out|privacy request|personal information/.test(`${form.innerText||''} ${form.action||''}`.toLowerCase());
     const submitter=!!form.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
-    return recognized*10+(privacy?8:0)+(submitter?3:0)-(/search/.test(`${form.role||''} ${form.id||''} ${form.className||''}`.toLowerCase())?30:0);
+    return recognized*10+(privacy?8:0)+(submitter?3:0)-(/search|newsletter|subscribe/.test(`${form.role||''} ${form.id||''} ${form.className||''} ${form.innerText||''}`.toLowerCase())?30:0);
   };
   const form=forms.sort((a,b)=>formScore(b)-formScore(a))[0]||null;
   const controls=form?allControls.filter(e=>e.form===form):allControls;
@@ -22,7 +22,7 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
   const clean=value=>{
     let text=String(value||'').replace(/\s+/g,' ').trim();
     for(const secret of redactValues)text=text.replace(new RegExp(escapeRegExp(secret.trim()),'gi'),'[redacted]');
-    return text.slice(0,180);
+    return text.slice(0,240);
   };
   const diagnosticControls=controls.slice(0,100).map((el,index)=>({
     index:index+1,
@@ -30,10 +30,19 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     label:clean(describe(el)), required:!!el.required,
     options:el.tagName==='SELECT'?[...el.options].slice(0,30).map(o=>clean(o.text)).filter(Boolean):[],
   }));
+  const rawLinks=[...document.querySelectorAll('a[href]')].filter(el=>{
+    const rect=el.getBoundingClientRect();
+    return rect.width>0&&rect.height>0;
+  }).slice(0,100);
+  const diagnosticLinks=rawLinks.map((el,index)=>{
+    let href='';let sameOrigin=false;
+    try{const target=new URL(el.href,location.href);href=target.href;sameOrigin=target.origin===location.origin;}catch{}
+    return {index:index+1,label:clean(`${el.innerText||''} ${el.getAttribute('aria-label')||''}`),href:clean(href),same_origin:sameOrigin};
+  });
   const diagnostics={
     page_title:clean(document.title),
     headings:[...document.querySelectorAll('h1,h2,h3,legend')].slice(0,25).map(e=>clean(e.innerText)).filter(Boolean),
-    controls:diagnosticControls,
+    controls:diagnosticControls,links:diagnosticLinks,
     detected:{captcha,form_candidates:forms.length,selected_form_score:form?formScore(form):0},
     attempted:{filled_fields:[],selected_choices:[],submit_authorized:!!submit},
   };
@@ -49,9 +58,12 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     }
   }
   diagnostics.attempted.filled_fields=[...filled];
-  const deletion=/delete|deletion|erase|erasure|remove my (personal )?(data|information)|do not sell|opt.?out/;
-  const dangerous=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear/;
+  const deletion=/delete|deletion|erase|erasure|remove my (personal )?(data|information)|do not sell|do not share|opt.?out/;
+  const dangerous=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear|truthful|perjury/;
   for(const el of controls.filter(e=>e.type==='radio'&&!e.checked)){
+    const label=describe(el);if(deletion.test(label)&&!dangerous.test(label)){el.click();selected.push('deletion request');break;}
+  }
+  for(const el of controls.filter(e=>e.type==='checkbox'&&!e.checked)){
     const label=describe(el);if(deletion.test(label)&&!dangerous.test(label)){el.click();selected.push('deletion request');break;}
   }
   for(const el of controls.filter(e=>e.tagName==='SELECT'&&!e.value)){
@@ -59,6 +71,7 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     const option=[...el.options].find(o=>deletion.test(o.text.toLowerCase())&&!dangerous.test(o.text.toLowerCase()));if(option){setValue(el,option.value);selected.push('deletion request');}
   }
   diagnostics.attempted.selected_choices=[...selected];
+  diagnostics.attempted.selected_choices=[...new Set(selected)];
   const legalRisk=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear|truthful|perjury/;
   const radioSatisfied=e=>e.type==='radio'&&!!e.name&&controls.some(other=>other.type==='radio'&&other.name===e.name&&other.checked);
   const risky=controls.filter(e=>
@@ -68,20 +81,27 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     (['checkbox','radio'].includes(e.type)&&legalRisk.test(describe(e)))
   );
   const missing=controls.filter(e=>e.required&&!e.value&&!e.checked&&!['checkbox','radio','file'].includes(e.type));
-  const summary=`Filled ${filled.length} profile field(s)${selected.length?` and selected ${selected.join(', ')}`:''}`;
+  const summary=`Filled ${filled.length} profile field(s)${selected.length?` and selected ${[...new Set(selected)].join(', ')}`:''}`;
   diagnostics.detected.required_unresolved=risky.length+missing.length;
-  const privacyPurpose=/delete|deletion|erase|erasure|remove|do not sell|opt.?out|privacy request|personal information/.test(`${visible} ${form?.action||''}`);
+  const privacyPurpose=/delete|deletion|erase|erasure|remove|do not sell|do not share|opt.?out|privacy request|personal information/.test(`${visible} ${form?.action||''}`);
   diagnostics.detected.safe_profile_form=!!form&&!!form.querySelector('button[type="submit"],input[type="submit"],button:not([type])')&&privacyPurpose&&!captcha&&!risky.length&&!missing.length&&filled.length>=2;
   if(captcha)return {outcome:'blocked',stage:'captcha',detail:`${summary}; CAPTCHA requires human completion`,diagnostics};
   if(risky.length||missing.length)return {outcome:'needs_review',stage:'inspection',detail:`${summary}; ${risky.length+missing.length} required or legal field(s) need review`,diagnostics};
   const button=form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
   if(!form||!button){
+    const requestPattern=/privacy request|consumer request|data request|privacy (rights?|choices?|center|policy|notice)|data rights?|exercise.{0,18}rights|submit.{0,12}request|request form|right to delete|do not sell|do not share|delete.{0,18}(data|information)|opt.?out/;
+    const rejectPattern=/cookie|newsletter|subscribe|search|login|sign in|careers|investor/;
     const requestControl=[...document.querySelectorAll('a[href],button,[role="button"]')].find(el=>{
       if(el.dataset?.datasniperFollowed==='1')return false;
       const label=clean(`${el.innerText||''} ${el.getAttribute('aria-label')||''} ${el.getAttribute('href')||''}`).toLowerCase();
-      if(!/privacy request|consumer request|data request|exercise.{0,12}rights|do not sell|do not share|delete.{0,12}(data|information)|opt.?out/.test(label))return false;
+      if(!requestPattern.test(label)||rejectPattern.test(label))return false;
       if(el.tagName!=='A')return true;
-      try{const target=new URL(el.href,location.href);return target.origin===location.origin;}catch{return false;}
+      try{
+        const target=new URL(el.href,location.href);
+        const current=new URL(location.href);
+        current.hash='';target.hash='';
+        return target.origin===location.origin&&target.href!==current.href;
+      }catch{return false;}
     });
     if(requestControl){
       requestControl.dataset.datasniperFollowed='1';
