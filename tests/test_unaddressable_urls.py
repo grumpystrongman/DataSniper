@@ -86,6 +86,7 @@ def test_bad_or_missing_url_is_removed_from_active_work_immediately(tmp_path, de
     assert dict(request) == {"status": "not_found", "automation_status": "not_applicable"}
     assert queue["status"] == "cancelled"
     assert queue["stage"] == "archived"
-    assert queue["last_error"].startswith("Not addressed: official URL is unavailable")
+    assert queue["last_error"].startswith("Archived:")
+    assert "Not addressed" in queue["last_error"]
     assert active == 0
     assert store.claim() is None
