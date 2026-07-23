@@ -70,6 +70,7 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     const context=describe(el);if(!/request|right|action|privacy/.test(context))continue;
     const option=[...el.options].find(o=>deletion.test(o.text.toLowerCase())&&!dangerous.test(o.text.toLowerCase()));if(option){setValue(el,option.value);selected.push('deletion request');}
   }
+  diagnostics.attempted.selected_choices=[...selected];
   diagnostics.attempted.selected_choices=[...new Set(selected)];
   const legalRisk=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear|truthful|perjury/;
   const radioSatisfied=e=>e.type==='radio'&&!!e.name&&controls.some(other=>other.type==='radio'&&other.name===e.name&&other.checked);
@@ -88,7 +89,7 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
   if(risky.length||missing.length)return {outcome:'needs_review',stage:'inspection',detail:`${summary}; ${risky.length+missing.length} required or legal field(s) need review`,diagnostics};
   const button=form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
   if(!form||!button){
-    const requestPattern=/privacy (request|rights?|choices?|center|policy|notice)|consumer request|data (request|rights?)|exercise.{0,18}rights|submit.{0,12}request|request form|right to delete|do not sell|do not share|delete.{0,18}(data|information)|opt.?out/;
+    const requestPattern=/privacy request|consumer request|data request|privacy (rights?|choices?|center|policy|notice)|data rights?|exercise.{0,18}rights|submit.{0,12}request|request form|right to delete|do not sell|do not share|delete.{0,18}(data|information)|opt.?out/;
     const rejectPattern=/cookie|newsletter|subscribe|search|login|sign in|careers|investor/;
     const requestControl=[...document.querySelectorAll('a[href],button,[role="button"]')].find(el=>{
       if(el.dataset?.datasniperFollowed==='1')return false;
