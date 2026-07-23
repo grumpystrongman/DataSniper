@@ -3,6 +3,7 @@ from fastapi.testclient import TestClient
 import app
 from browser_worker import BrowserResult
 from test_browser_worker import FakeExecutor, configured_db, make_worker
+from operational_log import redact
 
 
 def test_parent_states_are_mutually_exclusive(tmp_path, monkeypatch):
@@ -51,6 +52,26 @@ def test_parent_home_and_help_wizard_use_plain_language(tmp_path, monkeypatch):
     assert "One step at a time" in wizard.text
     assert "Complete the human check" in wizard.text
     assert "adapter" not in wizard.text.lower()
+
+
+def test_global_bot_badge_status_notifications_and_log_download(tmp_path, monkeypatch):
+    configured_db(tmp_path, monkeypatch)
+    app.create_notification("run_complete", "Privacy check complete", "One company checked")
+    client = TestClient(app.app, base_url="http://localhost")
+    home = client.get("/")
+    assert 'id="bot-status"' in home.text
+    assert 'fetch("/automation/status"' in home.text
+    status = client.get("/automation/status").json()
+    assert status["parent"]["state"] in {"working", "help_needed", "repair", "caught_up"}
+    assert status["unread_notifications"] == 1
+    assert status["latest_notification"]["title"] == "Privacy check complete"
+    app.audit("test_activity", "email=private@example.test token=secret")
+    downloaded = client.get("/automation/logs/download")
+    assert downloaded.status_code == 200
+    assert "test_activity" in downloaded.text
+    assert "private@example.test" not in downloaded.text
+    assert "secret" not in downloaded.text
+    assert redact("phone=555-0100") == "phone=[REDACTED]"
 
 
 def test_transient_failure_retries_then_exhausts_to_help(tmp_path, monkeypatch):

@@ -154,6 +154,11 @@ docker compose up -d --build
 ```
 
 Open `http://127.0.0.1:8787`, create the household administrator password, and follow the guided setup.
+Docker Compose starts a private Ollama sidecar, checks the persistent local
+model volume, and downloads the pinned Qwen3-VL model only when it is missing.
+The Ollama port is not exposed to the host or local network. The first startup
+may take several minutes while the model is downloaded; later starts reuse the
+local copy.
 
 ### Python
 
@@ -168,18 +173,24 @@ python -m venv .venv
 Windows:
 
 ```powershell
-.venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+.\install.ps1
 python run.py
 ```
 
 macOS or Linux:
 
 ```bash
-source .venv/bin/activate
-pip install -r requirements.txt
+./install.sh
 python run.py
 ```
+
+The installer checks for DataSniper's private local intelligence runtime and
+the pinned Qwen3-VL model, installs or downloads missing components, verifies
+that the model can be opened, and installs Chromium. In normal use the model is
+managed silently. It listens only on the local computer, receives sanitized
+page structure rather than household values, proposes constrained actions, and
+cannot submit forms or access arbitrary tools. DataSniper's policy engine and
+Playwright worker remain the only components allowed to act.
 
 ### Browser companion
 

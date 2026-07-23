@@ -13,13 +13,57 @@
     .filter-button.active{background:#14213d;color:white}
     .bulk-bar{position:sticky;bottom:12px;background:#f3f7fd;border:1px solid #ced7e5;border-radius:14px;padding:14px;display:flex;gap:12px;align-items:center;flex-wrap:wrap;z-index:2}
     .bulk-bar select{width:auto;min-width:220px}.item-check{width:22px;height:22px;margin:0 10px 0 0;vertical-align:middle}
+    .bot-status{display:inline-flex;align-items:center;gap:8px;color:white;padding:8px 11px;border-radius:999px;background:#33425f;font-size:.85rem;font-weight:750}
+    .bot-status-dot{width:12px;height:12px;border-radius:50%;background:#aeb8c8;box-shadow:0 0 0 3px rgba(255,255,255,.14)}
+    .bot-status.working .bot-status-dot{background:#61d394}.bot-status.help_needed .bot-status-dot{background:#ffc857}.bot-status.repair .bot-status-dot{background:#ff6b6b}.bot-status.caught_up .bot-status-dot{background:#78a9ff}
+    .bot-status[data-count]:after{content:attr(data-count);display:none;min-width:22px;height:22px;padding:2px 6px;border-radius:12px;background:#d98200;color:white;text-align:center}.bot-status.has-alerts:after{display:inline-block}
   </style>
 </head>
 <body>
 <header>
   <a href="/">DataSniper Privacy Agent</a>
   <nav><a href="/">Home</a> · <a href="/help-needed">Help Needed</a> · <a href="/history">History</a> · <a href="/settings">Settings</a></nav>
+  <a id="bot-status" class="bot-status" href="/automation" title="Checking the privacy bot" aria-live="polite">
+    <span class="bot-status-dot" aria-hidden="true"></span><span id="bot-status-text">Checking bot…</span>
+  </a>
 </header>
 <main>{% block content %}{% endblock %}</main>
+<script>
+(() => {
+  const badge = document.getElementById("bot-status");
+  const label = document.getElementById("bot-status-text");
+  let lastNotice = Number(localStorage.getItem("datasniper-last-notice") || 0);
+  const labels = {working:"Bot is working",help_needed:"Your help is needed",repair:"Bot needs attention",caught_up:"Bot is ready"};
+  async function updateBotStatus() {
+    try {
+      const response = await fetch("/automation/status", {cache:"no-store"});
+      if (!response.ok) throw new Error("status unavailable");
+      const data = await response.json();
+      const state = data.parent?.state || (data.worker?.online ? "working" : "repair");
+      badge.className = "bot-status " + state + (data.unread_notifications ? " has-alerts" : "");
+      badge.dataset.count = data.unread_notifications || "";
+      label.textContent = labels[state] || "Bot status";
+      badge.title = data.parent?.message || data.worker?.detail || "Open bot details";
+      const notice = data.latest_notification;
+      if (notice && Number(notice.id) > lastNotice) {
+        lastNotice = Number(notice.id);
+        localStorage.setItem("datasniper-last-notice", String(lastNotice));
+        if ("Notification" in window && Notification.permission === "granted") {
+          new Notification(notice.title, {body:notice.detail, tag:"datasniper-" + notice.kind});
+        }
+      }
+    } catch (_) {
+      badge.className = "bot-status repair";
+      label.textContent = "Bot status unavailable";
+      badge.title = "DataSniper could not read the background bot status.";
+    }
+  }
+  badge.addEventListener("click", () => {
+    if ("Notification" in window && Notification.permission === "default") Notification.requestPermission();
+  });
+  updateBotStatus();
+  setInterval(updateBotStatus, 15000);
+})();
+</script>
 </body>
 </html>
