@@ -1,0 +1,39 @@
+name: Apply failure recovery patch
+
+on:
+  push:
+    branches:
+      - agent/recover-automation-failures
+
+permissions:
+  contents: write
+
+jobs:
+  apply-and-verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: agent/recover-automation-failures
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip --quiet
+          pip install --quiet -r requirements.txt
+      - name: Materialize reviewed patch
+        run: python tools/apply_failure_recovery.py
+      - name: Run focused regression tests
+        run: pytest -q tests/test_failure_recovery.py tests/test_ai_decision_execution.py
+      - name: Compile changed modules
+        run: python -m compileall -q browser_executor.py browser_form_script.py browser_worker_core.py local_intelligence.py
+      - name: Remove temporary patch machinery
+        run: rm -rf tools/failure_recovery tools/apply_failure_recovery.py .github/workflows/apply-failure-recovery.yml
+      - name: Commit verified changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "Recover common privacy automation failures"
+          git push origin HEAD:agent/recover-automation-failures
