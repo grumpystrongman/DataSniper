@@ -229,11 +229,10 @@ class PlaywrightExecutor:
             progress("inspecting_form")
             text = self._body_text(page, 250_000)
             decision = match_identity(text, profile, variants)
-            allowed, reason = may_submit(policy, decision["score"], decision["strong_identifier"], adapter, bool(job["authorized"]))
             supplied = form_profile(profile)
             result = None
             for step in range(4):
-                result = page.evaluate(_FORM_SCRIPT, {"profile": supplied, "aliases": adapter.field_aliases, "submit": allowed})
+                result = page.evaluate(_FORM_SCRIPT, {"profile": supplied, "aliases": adapter.field_aliases, "submit": False})
                 if result.get("detail") == "No unambiguous submission form was found":
                     for frame in page.frames:
                         if frame == page.main_frame:
@@ -241,7 +240,7 @@ class PlaywrightExecutor:
                         try:
                             frame_result = frame.evaluate(
                                 _FORM_SCRIPT,
-                                {"profile": supplied, "aliases": adapter.field_aliases, "submit": allowed},
+                                {"profile": supplied, "aliases": adapter.field_aliases, "submit": False},
                             )
                         except Exception:
                             continue
@@ -249,6 +248,21 @@ class PlaywrightExecutor:
                             result = frame_result
                             result.setdefault("diagnostics", {})["embedded_frame_url"] = frame.url[:500]
                             break
+                safe_profile_form = bool((result.get("diagnostics") or {}).get("detected", {}).get("safe_profile_form"))
+                allowed, reason = may_submit(
+                    policy, decision["score"], decision["strong_identifier"], adapter,
+                    bool(job["authorized"]), safe_profile_form=safe_profile_form,
+                )
+                if allowed and result["outcome"] == "needs_review" and result["stage"] == "authorization":
+                    target = next(
+                        (frame for frame in page.frames
+                         if (result.get("diagnostics") or {}).get("embedded_frame_url") == frame.url),
+                        page,
+                    )
+                    result = target.evaluate(
+                        _FORM_SCRIPT,
+                        {"profile": supplied, "aliases": adapter.field_aliases, "submit": True},
+                    )
                 result["match_score"] = decision["score"]
                 if result["outcome"] != "advanced":
                     break
@@ -280,7 +294,7 @@ class PlaywrightExecutor:
                 return BrowserResult("failed", "confirmation", "The broker page reported that submission failed", page.url,
                                      decision["score"], screenshot=self._screenshot(page),
                                      diagnostics=diagnostics)
-            outcome = "confirmed" if confirmation in {"accepted", "completed"} else "submitted"
+            outcome = "confirmed" if confirmation == "completed" else "submitted"
             detail = "Broker confirmed receipt" if confirmation == "accepted" else (
                 "Broker reported completion" if confirmation == "completed" else "Form submitted; awaiting broker response"
             )
@@ -293,9 +307,19 @@ class PlaywrightExecutor:
 _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
   const visible=(document.body?.innerText||'').toLowerCase();
   const captcha=!!document.querySelector('iframe[src*="captcha" i],.g-recaptcha,[class*="captcha" i],[id*="captcha" i],[data-sitekey]')||/verify you are human|complete the captcha|security challenge/.test(visible);
-  const controls=[...document.querySelectorAll('input,textarea,select')].filter(e=>!e.disabled&&e.type!=='hidden');
-  let filled=[];
   const describe=e=>`${e.name||''} ${e.id||''} ${e.placeholder||''} ${e.getAttribute('aria-label')||''} ${e.labels?[...e.labels].map(x=>x.innerText).join(' '):''}`.toLowerCase();
+  const allControls=[...document.querySelectorAll('input,textarea,select')].filter(e=>!e.disabled&&e.type!=='hidden');
+  const forms=[...document.querySelectorAll('form')];
+  const formScore=form=>{
+    const candidates=allControls.filter(e=>e.form===form);
+    const recognized=candidates.filter(e=>Object.values(aliases).flat().some(name=>describe(e).includes(name))).length;
+    const privacy=/delete|deletion|erase|erasure|remove|do not sell|opt.?out|privacy request|personal information/.test(`${form.innerText||''} ${form.action||''}`.toLowerCase());
+    const submitter=!!form.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
+    return recognized*10+(privacy?8:0)+(submitter?3:0)-(/search/.test(`${form.role||''} ${form.id||''} ${form.className||''}`.toLowerCase())?30:0);
+  };
+  const form=forms.sort((a,b)=>formScore(b)-formScore(a))[0]||null;
+  const controls=form?allControls.filter(e=>e.form===form):allControls;
+  let filled=[];
   const setValue=(el,value)=>{const proto=el.tagName==='TEXTAREA'?HTMLTextAreaElement.prototype:el.tagName==='SELECT'?HTMLSelectElement.prototype:HTMLInputElement.prototype;const setter=Object.getOwnPropertyDescriptor(proto,'value')?.set;setter?setter.call(el,value):el.value=value;el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));};
   const escapeRegExp=value=>value.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
   const redactValues=Object.values(profile).filter(value=>typeof value==='string'&&value.trim().length>=3);
@@ -314,14 +338,15 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     page_title:clean(document.title),
     headings:[...document.querySelectorAll('h1,h2,h3,legend')].slice(0,25).map(e=>clean(e.innerText)).filter(Boolean),
     controls:diagnosticControls,
-    detected:{captcha},
+    detected:{captcha,form_candidates:forms.length,selected_form_score:form?formScore(form):0},
     attempted:{filled_fields:[],selected_choices:[],submit_authorized:!!submit},
   };
   let selected=[];
   for(const [field,names] of Object.entries(aliases)) {
     if(!profile[field]) continue;
     const el=controls.find(e=>!['checkbox','radio','file','submit','button'].includes(e.type)&&names.some(n=>describe(e).includes(n)));
-    if(el&&!el.value){
+    if(el&&el.value&&String(el.value).trim().toLowerCase()===String(profile[field]).trim().toLowerCase())filled.push(field);
+    else if(el&&!el.value){
       if(el.tagName==='SELECT'){const target=[...el.options].find(o=>o.value.toLowerCase()===profile[field].toLowerCase()||o.text.toLowerCase()===profile[field].toLowerCase()||o.text.toLowerCase().includes(profile[field].toLowerCase()));if(target)setValue(el,target.value);else continue;}
       else setValue(el,profile[field]);
       filled.push(field);
@@ -338,13 +363,21 @@ _FORM_SCRIPT = r"""({profile, aliases, submit}) => {
     const option=[...el.options].find(o=>deletion.test(o.text.toLowerCase())&&!dangerous.test(o.text.toLowerCase()));if(option){setValue(el,option.value);selected.push('deletion request');}
   }
   diagnostics.attempted.selected_choices=[...selected];
-  const risky=controls.filter(e=>['checkbox','radio','file'].includes(e.type)&&e.required&&!e.checked);
+  const legalRisk=/agree|consent|attest|certif|penalty|authorized agent|terms|signature|swear|truthful|perjury/;
+  const radioSatisfied=e=>e.type==='radio'&&!!e.name&&controls.some(other=>other.type==='radio'&&other.name===e.name&&other.checked);
+  const risky=controls.filter(e=>
+    e.type==='file'||e.type==='password'||
+    (e.type==='checkbox'&&e.required&&!e.checked)||
+    (e.type==='radio'&&e.required&&!radioSatisfied(e))||
+    (['checkbox','radio'].includes(e.type)&&legalRisk.test(describe(e)))
+  );
   const missing=controls.filter(e=>e.required&&!e.value&&!e.checked&&!['checkbox','radio','file'].includes(e.type));
   const summary=`Filled ${filled.length} profile field(s)${selected.length?` and selected ${selected.join(', ')}`:''}`;
   diagnostics.detected.required_unresolved=risky.length+missing.length;
+  const privacyPurpose=/delete|deletion|erase|erasure|remove|do not sell|opt.?out|privacy request|personal information/.test(`${visible} ${form?.action||''}`);
+  diagnostics.detected.safe_profile_form=!!form&&!!form.querySelector('button[type="submit"],input[type="submit"],button:not([type])')&&privacyPurpose&&!captcha&&!risky.length&&!missing.length&&filled.length>=2;
   if(captcha)return {outcome:'blocked',stage:'captcha',detail:`${summary}; CAPTCHA requires human completion`,diagnostics};
   if(risky.length||missing.length)return {outcome:'needs_review',stage:'inspection',detail:`${summary}; ${risky.length+missing.length} required or legal field(s) need review`,diagnostics};
-  const form=controls.find(e=>e.form)?.form||document.querySelector('form');
   const button=form?.querySelector('button[type="submit"],input[type="submit"],button:not([type])');
   if(!form||!button){
     const requestControl=[...document.querySelectorAll('a[href],button,[role="button"]')].find(el=>{

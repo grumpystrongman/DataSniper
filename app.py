@@ -638,7 +638,9 @@ def record_submission_transaction(
         raise ValueError("Unsupported submission transaction")
     score = None if match_score is None else max(0, min(100, int(match_score)))
     with db() as conn:
-        row = conn.execute("SELECT broker_name,registry_id FROM requests WHERE id=?", (request_id,)).fetchone()
+        row = conn.execute(
+            "SELECT broker_slug,broker_name,registry_id FROM requests WHERE id=?", (request_id,)
+        ).fetchone()
         if not row:
             raise LookupError("Request not found")
         conn.execute(
@@ -653,6 +655,25 @@ def record_submission_transaction(
                   "filled": "ready_to_submit", "matched": "match_found", "no_match": "no_match"}.get(outcome, "running")
         conn.execute("UPDATE requests SET automation_status=?,match_score=COALESCE(?,match_score) WHERE id=?",
                      (status, score, request_id))
+        if outcome == "submitted":
+            try:
+                broker = broker_by_slug(row["broker_slug"])
+            except StopIteration:
+                broker = None
+            submitted_on = date.today()
+            due = submitted_on + timedelta(days=int(broker["days"]) if broker else 45)
+            verify = due + timedelta(days=7)
+            conn.execute(
+                """UPDATE requests SET status='waiting',submitted_at=COALESCE(submitted_at,?),
+                due_at=?,verify_at=?,confirmation_status='awaiting_email' WHERE id=?""",
+                (utcnow(), due.isoformat(), verify.isoformat(), request_id),
+            )
+        elif outcome == "confirmed":
+            conn.execute(
+                """UPDATE requests SET status='removed',last_checked_at=?,
+                confirmation_status='completed' WHERE id=?""",
+                (utcnow(), request_id),
+            )
         if stage == "submission":
             conn.execute(
                 """UPDATE broker_automation SET attempt_count=attempt_count+1,last_attempt_at=?

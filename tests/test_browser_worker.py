@@ -63,6 +63,15 @@ def test_form_inspection_discovers_privacy_controls_and_embedded_forms():
     assert any("embedded_frame_url" in value for value in source if isinstance(value, str))
 
 
+def test_form_inspection_prefers_privacy_form_and_blocks_legal_controls():
+    assert "forms.sort((a,b)=>formScore(b)-formScore(a))" in _FORM_SCRIPT
+    assert "recognized*10" in _FORM_SCRIPT
+    assert "safe_profile_form" in _FORM_SCRIPT
+    assert "e.type==='file'||e.type==='password'" in _FORM_SCRIPT
+    assert "truthful|perjury" in _FORM_SCRIPT
+    assert "radioSatisfied(e)" in _FORM_SCRIPT
+
+
 def test_body_text_uses_first_body_match():
     class Locator:
         def __init__(self):
@@ -97,13 +106,37 @@ def test_worker_claims_runs_and_records_live_timestamps(tmp_path, monkeypatch):
     assert make_worker(FakeExecutor()).run_once() is True
     with app.db() as conn:
         queue = conn.execute("SELECT * FROM runner_queue WHERE request_id=?", (request_id,)).fetchone()
-        request = conn.execute("SELECT automation_status FROM requests WHERE id=?", (request_id,)).fetchone()
+        request = conn.execute(
+            """SELECT status,automation_status,submitted_at,due_at,verify_at,confirmation_status
+            FROM requests WHERE id=?""", (request_id,)
+        ).fetchone()
         transactions = conn.execute("SELECT outcome FROM submission_transactions WHERE request_id=? ORDER BY id", (request_id,)).fetchall()
     assert queue["status"] == "completed"
     assert queue["started_at"] and queue["heartbeat_at"] and queue["finished_at"]
     assert queue["stage"] == "confirmation"
     assert request["automation_status"] == "awaiting_response"
+    assert request["status"] == "waiting"
+    assert request["submitted_at"] and request["due_at"] and request["verify_at"]
+    assert request["confirmation_status"] == "awaiting_email"
     assert [row["outcome"] for row in transactions] == ["started", "submitted"]
+
+
+def test_broker_completion_marks_request_removed(tmp_path, monkeypatch):
+    request_id = configured_db(tmp_path, monkeypatch)
+    result = BrowserResult(
+        "confirmed", "confirmation", "Broker reported completion",
+        "https://example.test/done", 90, "completed",
+    )
+    assert make_worker(FakeExecutor(result=result)).run_once() is True
+    with app.db() as conn:
+        request = conn.execute(
+            "SELECT status,automation_status,confirmation_status,last_checked_at FROM requests WHERE id=?",
+            (request_id,),
+        ).fetchone()
+    assert request["status"] == "removed"
+    assert request["automation_status"] == "completed"
+    assert request["confirmation_status"] == "completed"
+    assert request["last_checked_at"]
 
 
 def test_operator_rerun_is_claimed_ahead_of_automatic_backlog(tmp_path, monkeypatch):
