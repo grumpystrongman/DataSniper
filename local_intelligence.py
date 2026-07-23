@@ -4,6 +4,8 @@ from __future__ import annotations
 import base64
 import json
 import os
+import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -17,6 +19,10 @@ PRIVATE_RUNTIME_HOSTS = {"127.0.0.1", "::1", "localhost", "ollama"}
 ALLOWED_ACTIONS = {
     "retry_deterministic", "open_privacy_link", "inspect_embedded_form",
     "fill_without_submitting", "request_human_help", "archive_unavailable",
+}
+_provision_lock = threading.Lock()
+_provision_state: dict[str, Any] = {
+    "state": "idle", "detail": "", "started_at": None, "finished_at": None,
 }
 
 
@@ -57,6 +63,7 @@ class LocalIntelligence:
             "available": False, "installed": False, "loaded": False,
             "responding": False, "model": self.model, "endpoint": self.endpoint,
             "detail": "Local intelligence runtime is not responding",
+            "provisioning": dict(_provision_state),
         }
         try:
             with urllib.request.urlopen(f"{self.endpoint}/api/tags", timeout=timeout) as response:
@@ -66,7 +73,12 @@ class LocalIntelligence:
                 self._model_name(item) == self.model for item in payload.get("models", [])
             )
             if not result["installed"]:
-                result["detail"] = f"The pinned model {self.model} is not installed"
+                if _provision_state["state"] == "installing":
+                    result["detail"] = f"Installing the private AI model {self.model} in the background"
+                elif _provision_state["state"] == "failed":
+                    result["detail"] = _provision_state["detail"]
+                else:
+                    result["detail"] = f"The pinned model {self.model} is not installed"
                 return result
             try:
                 with urllib.request.urlopen(f"{self.endpoint}/api/ps", timeout=timeout) as response:
@@ -100,6 +112,51 @@ class LocalIntelligence:
             return result
         except (OSError, ValueError, urllib.error.URLError):
             return result
+
+    def ensure_model_async(self) -> bool:
+        """Provision the pinned model once, without blocking application startup."""
+        state = self.status()
+        if state["installed"]:
+            return False
+        if not state["available"] or _provision_state["state"] == "installing":
+            return False
+        with _provision_lock:
+            if _provision_state["state"] == "installing":
+                return False
+            _provision_state.update({
+                "state": "installing",
+                "detail": f"Downloading {self.model}; DataSniper will use it automatically when ready",
+                "started_at": time.time(),
+                "finished_at": None,
+            })
+            threading.Thread(target=self._provision_model, name="datasniper-model-setup", daemon=True).start()
+        return True
+
+    def _provision_model(self) -> None:
+        try:
+            request = urllib.request.Request(
+                f"{self.endpoint}/api/pull",
+                data=json.dumps({"name": self.model, "stream": False}).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=3600) as response:
+                payload = json.load(response)
+            if str(payload.get("status", "")).lower() != "success":
+                raise RuntimeError("The local model runtime did not confirm a successful download")
+            verified = self.status(timeout=5, verify_inference=True)
+            if not (verified["installed"] and verified["responding"]):
+                raise RuntimeError("The model downloaded but did not pass its private inference check")
+            _provision_state.update({
+                "state": "ready", "detail": f"{self.model} is installed and responding",
+                "finished_at": time.time(),
+            })
+        except (OSError, RuntimeError, ValueError, urllib.error.URLError) as exc:
+            _provision_state.update({
+                "state": "failed",
+                "detail": f"Automatic model installation failed: {str(exc)[:240]}",
+                "finished_at": time.time(),
+            })
 
     def health(self, timeout: float = 1.5) -> bool:
         state = self.status(timeout=timeout)
