@@ -1048,6 +1048,8 @@ def latest_run_receipt() -> dict[str, Any] | None:
 def startup() -> None:
     init_db()
     refresh_due_statuses()
+    from local_intelligence import LocalIntelligence
+    LocalIntelligence().ensure_model_async()
 
 
 @app.get("/health")
@@ -1199,6 +1201,9 @@ def clear_failure_diagnostics(mode: str = Form("older")):
 def automation_status() -> dict[str, Any]:
     """Small live payload used by the operator console to verify real worker health."""
     overview = automation_overview()
+    if not overview["intelligence"]["installed"]:
+        from local_intelligence import LocalIntelligence
+        LocalIntelligence().ensure_model_async()
     with db() as conn:
         unread = conn.execute("SELECT COUNT(*) FROM notifications WHERE read_at IS NULL").fetchone()[0]
         latest = conn.execute(
