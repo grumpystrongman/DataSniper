@@ -207,7 +207,7 @@ class QueueStore:
                 WHERE id=? AND worker_id=?""",
                 (queue_state, "archived" if permanent_url_failure else ("retry_scheduled" if retryable_failure else result.stage),
                  None if retryable_failure else now, now,
-                 ((("Not addressed: official URL is unavailable — " if permanent_url_failure else "") + result.detail)[:1000]
+                 ((("Archived: Not addressed because official URL is unavailable — " if permanent_url_failure else "") + result.detail)[:1000]
                   if queue_state != "completed" else ""), retry_at if retryable_failure else now,
                  None if retryable_failure else self.worker_id, job["queue_id"], self.worker_id),
             )
