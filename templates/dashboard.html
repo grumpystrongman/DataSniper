@@ -1,64 +1,42 @@
 {% extends "base.html" %}
 {% block content %}
+<section class="hero-state {{ parent.overall.state }}" aria-live="polite">
+  <p class="eyebrow">Your privacy protection</p>
+  <h1>{{ parent.overall.title }}</h1>
+  <p class="hero-message">{{ parent.overall.message }}</p>
+  {% if parent.overall.action %}
+    {% if parent.overall.href == '/recover' %}<form method="post" action="/recover"><button type="submit">{{ parent.overall.action }}</button></form>
+    {% else %}<a class="button" href="{{ parent.overall.href }}">{{ parent.overall.action }}</a>{% endif %}
+  {% endif %}
+</section>
+
 <div class="card">
-  <h1>Hello, {{ profile.full_name }}</h1>
-  <p class="muted">Your agent is tracking privacy work and will surface only the next thing that needs you.</p>
-  <div class="grid">
-    <div><div class="metric">{{ summary.total }}</div><div class="muted">protections tracked</div></div>
-    <div><div class="metric">{{ summary.waiting }}</div><div class="muted">waiting on companies</div></div>
-    <div><div class="metric">{{ summary.done }}</div><div class="muted">completed</div></div>
-    <div><div class="metric">{{ summary.attention }}</div><div class="muted">need a recheck</div></div>
-    <div><div class="metric">{{ summary.exposures }}</div><div class="muted">active breach findings</div></div>
+  <h2>What is happening</h2>
+  <div class="parent-counts">
+    <div><span class="metric">{{ parent.counts.protected }}</span><span>Protected</span></div>
+    <div><span class="metric">{{ parent.counts.sent }}</span><span>Requests sent</span></div>
+    <div><span class="metric">{{ parent.counts.working }}</span><span>Working now</span></div>
+    <div><span class="metric">{{ parent.counts.queued + parent.counts.retrying }}</span><span>Waiting their turn</span></div>
+    <div class="{{ 'needs-help' if parent.counts.help_needed else '' }}"><span class="metric">{{ parent.counts.help_needed }}</span><span>Your help needed</span></div>
   </div>
+  <p class="muted">Each company appears in exactly one status. Next automatic check: {{ parent.next_check }}.</p>
 </div>
-<div class="card {% if automation.attention %}notice{% endif %}">
-  <h2>Privacy autopilot</h2>
-  <p><strong>{{ automation.full }}</strong> fully automated · <strong>{{ automation.assisted }}</strong> assisted · <strong>{{ automation.queue }}</strong> queued · <strong>{{ automation.attention }}</strong> exceptions</p>
-  <p class="muted">The daily runner prepares supported work and sends only ambiguous matches, CAPTCHAs, attestations, and broken workflows to your attention queue.</p>
-  <a class="button" href="/automation">Open Automation Center</a>
-</div>
-<div class="card {% if summary.exposures %}notice{% endif %}">
-  <h2>Exposure monitor</h2>
-  {% if summary.exposures %}<p><strong>{{ summary.exposures }} finding(s) need action.</strong> DataSniper has translated the breach data into concrete next steps.</p>{% else %}<p class="muted">No active breach findings are stored. The agent checks configured accounts daily.</p>{% endif %}
-  <a class="button" href="/exposures">Open Exposure Center</a>
-</div>
+
+{% if receipt %}
 <div class="card">
-  <h2>Broker coverage</h2>
-  <p><strong>{{ summary.registry.total }}</strong> official registry entities monitored · <strong>{{ summary.total }}</strong> verified removal workflows active</p>
-  <p class="muted">Registry entries are broad surveillance coverage. Only a free official removal path that passes review becomes an actionable task.</p>
-  <a class="button secondary" href="/coverage">Review coverage</a>
+  <h2>Most recent check</h2>
+  <p>Checked {{ receipt.total }} companies: {{ receipt.sent }} requests sent, {{ receipt.protected }} protected, {{ receipt.retrying }} retrying automatically, {{ receipt.help_needed }} needing help, and {{ receipt.archived }} archived.</p>
+  <p class="muted">Completed {{ receipt.finished_at }}.</p>
 </div>
-{% if next_task %}
-<div class="card">
-  <h2>Your next step</h2>
-  <p><strong>{{ next_task.broker_name }}</strong></p>
-  <p class="muted">{{ next_task.notes }}</p>
-  {% if next_task.status == 'verification_due' %}<p class="notice">The company’s expected removal window has passed. Recheck the listing and record what you find.</p>{% endif %}
-  <a class="button" href="/task/{{ next_task.id }}">Continue protection</a>
-</div>
-{% else %}
-<div class="card good"><h2>You are caught up</h2><p>The agent will continue tracking waiting periods and future verification dates.</p></div>
 {% endif %}
+
 <div class="card">
-  <h2>Identity variants</h2>
-  <p class="muted">Former names, addresses, email addresses, phone numbers, and associated relatives help you recognize broker records. Values are encrypted locally.</p>
-  {% for item in identity_variants %}
-  <div class="task-row"><div><strong>{{ item.kind.replace('_',' ')|title }}:</strong> {{ item.value }}{% if item.label %}<br><span class="muted">{{ item.label }}</span>{% endif %}</div><form method="post" action="/identity-variants/{{ item.id }}/delete"><button class="secondary" type="submit">Delete</button></form></div>
-  {% endfor %}
-  <form method="post" action="/identity-variants">
-    <label>Type</label><select name="kind"><option value="name">Former or alternate name</option><option value="address">Previous address</option><option value="email">Old email</option><option value="phone">Old phone</option><option value="relative">Associated relative</option></select>
-    <label>Value</label><input name="value" required autocomplete="off">
-    <label>Private note, optional</label><input name="label" autocomplete="off">
-    <button type="submit">Add encrypted variant</button>
-  </form>
-</div>
-<div class="card">
-  <h2>All protection tasks</h2>
-  {% for item in requests %}
-  <div class="task-row">
-    <div class="details"><strong>{{ item.broker_name }}</strong><br><span class="muted">{{ item.notes }}</span><br><span class="status {{ item.status }}">{{ item.status.replace('_',' ') }}</span></div>
-    <a class="button secondary" href="/task/{{ item.id }}">View</a>
-  </div>
-  {% endfor %}
+  <h2>Ongoing protection</h2>
+  <p>DataSniper starts with the app, retries temporary problems, checks submitted requests, and watches for information that returns. You only see a task when a person truly must act.</p>
+  <a class="button secondary" href="/history">View history</a>
+  <details class="advanced"><summary>Advanced details</summary>
+    <p>For troubleshooting, queue controls, failure reports, and broker coverage.</p>
+    <a class="button secondary" href="/automation">Open advanced details</a>
+  </details>
 </div>
 {% endblock %}

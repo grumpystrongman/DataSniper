@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>History</h1>
+  <p class="hero-message">A simple receipt for each privacy check.</p>
+  {% for run in runs %}
+  <div class="task-row"><div><strong>{{ 'Complete' if run.status == 'complete' else 'In progress' }} · {{ run.started_at }}</strong><br><span class="muted">{{ run.total }} checked · {{ run.sent }} sent · {{ run.protected }} protected · {{ run.retrying }} retrying · {{ run.help_needed }} need help · {{ run.archived }} archived</span></div></div>
+  {% else %}<p>No completed checks yet. DataSniper will add a receipt after the next run.</p>{% endfor %}
+</div>
+<div class="card"><h2>Notices</h2>
+  {% for notice in notifications %}<div class="task-row"><div><strong>{{ notice.title }}</strong><br><span class="muted">{{ notice.detail }}</span></div><small>{{ notice.created_at }}</small></div>
+  {% else %}<p>No notices.</p>{% endfor %}
+</div>
+{% endblock %}

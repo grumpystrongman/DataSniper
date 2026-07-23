@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="card">
+  <h1>Settings</h1>
+  {% if request.query_params.get('saved') %}<div class="good">Your settings were saved.</div>{% endif %}
+  <form method="post" action="/settings">
+    <label><input class="item-check" type="checkbox" name="trusted_helper_enabled" value="true" {% if helper_enabled %}checked{% endif %}> Allow my trusted helper{% if helper_name %}, {{ helper_name }}{% endif %}, to review difficult requests</label>
+    <p class="muted">Trusted-helper mode surfaces only cases that DataSniper cannot safely complete. It never changes automatic-submission safety rules.</p>
+    <label><input class="item-check" type="checkbox" name="notification_help_needed" value="true" {% if help_notifications %}checked{% endif %}> Tell me when my help is truly required</label>
+    <label><input class="item-check" type="checkbox" name="notification_run_complete" value="true" {% if run_notifications %}checked{% endif %}> Tell me when a privacy check is complete</label>
+    <button type="submit">Save settings</button>
+  </form>
+  <details class="advanced"><summary>Advanced and support</summary>
+    <p><a href="/automation">Automation details</a> · <a href="/coverage">Broker coverage</a> · <a href="/exposures">Exposure monitoring</a> · <a href="/audit">Technical audit</a></p>
+  </details>
+</div>
+{% endblock %}

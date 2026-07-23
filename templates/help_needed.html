@@ -1,0 +1,23 @@
+{% extends "base.html" %}
+{% block content %}
+{% if item %}
+<div class="card help-wizard">
+  <p class="eyebrow">One step at a time · {{ remaining }} remaining</p>
+  <h1>{{ item.broker_name }} needs your help</h1>
+  <p class="hero-message">DataSniper could not safely finish this request without you. Your other privacy work will continue automatically.</p>
+  {% if item.job and item.job.last_error %}<div class="notice">{{ item.job.last_error }}</div>{% endif %}
+  <ol class="simple-steps">
+    <li>Open the company’s official page.</li>
+    <li>Complete the human check or requested confirmation.</li>
+    <li>Return here and ask DataSniper to continue.</li>
+  </ol>
+  <div class="actions">
+    <a class="button" href="{{ item.url }}" target="_blank" rel="noopener">Open official page</a>
+    <form method="post" action="/help-needed/{{ item.id }}/retry"><button class="success" type="submit">I’m done — continue</button></form>
+  </div>
+  <details class="advanced"><summary>I need more options</summary><a href="/task/{{ item.id }}">Open detailed request record</a></details>
+</div>
+{% else %}
+<div class="card good"><h1>You’re all caught up</h1><p>There is nothing you need to do. DataSniper will keep working in the background.</p><a class="button" href="/">Return home</a></div>
+{% endif %}
+{% endblock %}
