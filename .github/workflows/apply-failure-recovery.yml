@@ -19,23 +19,29 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: agent/recover-automation-failures
-      - name: Stop after materialization cleanup
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') == '' }}
-        run: echo "Recovery patch is already materialized."
+      - name: Check whether patch needs materialization
+        id: gate
+        run: |
+          if [ -f tools/apply_failure_recovery.py ]; then
+            echo "apply=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "apply=false" >> "$GITHUB_OUTPUT"
+            echo "Recovery patch is already materialized."
+          fi
       - uses: actions/setup-python@v5
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         with:
           python-version: "3.12"
       - name: Install test dependencies
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         run: |
           python -m pip install --upgrade pip --quiet
           pip install --quiet -r requirements.txt
       - name: Materialize reviewed patch
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         run: python tools/apply_failure_recovery.py
       - name: Capture focused regression results
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         run: |
           set +e
           pytest -q tests/test_failure_recovery.py tests/test_ai_decision_execution.py > failure-recovery-test.log 2>&1
@@ -44,13 +50,13 @@ jobs:
           echo "Focused test exit status: $status" >> failure-recovery-test.log
           exit 0
       - name: Compile changed modules
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         run: python -m compileall -q browser_executor.py browser_form_script.py browser_worker_core.py local_intelligence.py
       - name: Remove temporary payloads
-        if: ${{ hashFiles('tools/apply_failure_recovery.py') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         run: rm -rf tools/failure_recovery tools/apply_failure_recovery.py
       - name: Commit materialized changes and test output
-        if: ${{ hashFiles('failure-recovery-test.log') != '' }}
+        if: steps.gate.outputs.apply == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
