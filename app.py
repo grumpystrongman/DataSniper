@@ -263,6 +263,27 @@ def init_db() -> None:
                 finished_at TEXT,
                 last_error TEXT NOT NULL DEFAULT ''
             );
+            CREATE TABLE IF NOT EXISTS automation_runs (
+                id TEXT PRIMARY KEY,
+                started_at TEXT NOT NULL,
+                finished_at TEXT,
+                total INTEGER NOT NULL DEFAULT 0,
+                protected INTEGER NOT NULL DEFAULT 0,
+                sent INTEGER NOT NULL DEFAULT 0,
+                retrying INTEGER NOT NULL DEFAULT 0,
+                help_needed INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'running'
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                title TEXT NOT NULL,
+                detail TEXT NOT NULL,
+                request_id INTEGER REFERENCES requests(id) ON DELETE CASCADE,
+                read_at TEXT
+            );
             """
         )
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(requests)")}
@@ -364,6 +385,14 @@ def init_db() -> None:
         conn.execute(
             "INSERT OR IGNORE INTO settings(key,value) VALUES('authorization_policy','ask')"
         )
+        for name, value in (
+            ("trusted_helper_enabled", "0"),
+            ("notification_help_needed", "1"),
+            ("notification_run_complete", "1"),
+            ("verification_interval_days", "30"),
+            ("resurfacing_interval_days", "30"),
+        ):
+            conn.execute("INSERT OR IGNORE INTO settings(key,value) VALUES(?,?)", (name, value))
 
 
 def profile() -> dict[str, str] | None:
@@ -492,6 +521,86 @@ def failure_diagnostic_summary(rows: list[dict[str, Any]]) -> list[dict[str, Any
     return sorted(groups.values(), key=lambda item: (-item["count"], item["stage"], item["reason"]))
 
 
+PARENT_STATES = ("protected", "sent", "working", "queued", "retrying", "help_needed", "archived")
+
+
+def resolve_parent_state(request_row: dict[str, Any], job: dict[str, Any] | None = None) -> str:
+    """Return the single user-facing state for a request.
+
+    Queue state has precedence while work is active; terminal request outcomes
+    have precedence otherwise. This is the only status resolver used by the
+    parent-facing product.
+    """
+    status = request_row.get("status") or "prepared"
+    automation_status = request_row.get("automation_status") or "not_started"
+    if job and job.get("status") == "running":
+        return "working"
+    if job and job.get("status") == "queued":
+        return "queued" if (job.get("run_after") or "") <= utcnow() else "retrying"
+    if automation_status in {"human_action_required", "manual_review"} or (
+        job and job.get("status") == "attention"
+    ):
+        return "help_needed"
+    if status == "removed" or automation_status == "completed":
+        return "protected"
+    if status in {"not_found", "archived"} or automation_status == "not_applicable":
+        return "archived"
+    if status == "waiting" or automation_status == "awaiting_response":
+        return "sent"
+    if automation_status == "failed" or (job and job.get("status") == "failed"):
+        return "retrying"
+    return "queued"
+
+
+def parent_status_model() -> dict[str, Any]:
+    """Build mutually exclusive counts and one plain-language overall state."""
+    with db() as conn:
+        requests = [dict(row) for row in conn.execute(
+            "SELECT * FROM requests ORDER BY broker_name"
+        )]
+        jobs = {}
+        for row in conn.execute(
+            """SELECT * FROM runner_queue
+            WHERE id IN (SELECT MAX(id) FROM runner_queue GROUP BY request_id)"""
+        ):
+            jobs[row["request_id"]] = dict(row)
+    groups = {state: [] for state in PARENT_STATES}
+    for item in requests:
+        item["parent_state"] = resolve_parent_state(item, jobs.get(item["id"]))
+        item["job"] = jobs.get(item["id"])
+        groups[item["parent_state"]].append(item)
+    counts = {state: len(groups[state]) for state in PARENT_STATES}
+    worker_state = setting("browser_worker_state") or "offline"
+    if counts["help_needed"]:
+        overall = {
+            "state": "help_needed", "title": "We need your help",
+            "message": f"DataSniper needs one simple action from you. The other {max(0, len(requests)-counts['help_needed'])} companies are still being handled.",
+            "action": "Help with the next request", "href": "/help-needed",
+        }
+    elif counts["working"] or counts["queued"] or counts["retrying"]:
+        overall = {
+            "state": "working", "title": "DataSniper is handling everything",
+            "message": f"{counts['working']} company is being checked now and {counts['queued'] + counts['retrying']} will continue automatically.",
+            "action": "", "href": "",
+        }
+    elif worker_state == "failed":
+        overall = {
+            "state": "repair", "title": "DataSniper needs to restart",
+            "message": "Your requests are safe. DataSniper can retry the background service automatically.",
+            "action": "Fix DataSniper", "href": "/recover",
+        }
+    else:
+        overall = {
+            "state": "caught_up", "title": "Everything is handled",
+            "message": "There is nothing you need to do. DataSniper will keep checking automatically.",
+            "action": "", "href": "",
+        }
+    return {
+        "total": len(requests), "counts": counts, "groups": groups, "overall": overall,
+        "next_check": setting("next_protection_check") or "within 24 hours",
+    }
+
+
 def automation_overview() -> dict[str, Any]:
     with db() as conn:
         rows = conn.execute(
@@ -583,6 +692,7 @@ def automation_overview() -> dict[str, Any]:
         "activity": [dict(row) for row in queue_rows],
         "groups": groups,
         "group_counts": {key: len(value) for key, value in groups.items()},
+        "parent": parent_status_model(),
     }
 
 
@@ -604,7 +714,7 @@ def store_automation_evidence(request_id: int, content: bytes, filename: str, no
         )
 
 
-def queue_eligible_requests() -> int:
+def queue_eligible_requests(batch_id: str | None = None) -> int:
     now = utcnow()
     with db() as conn:
         rows = conn.execute(
@@ -620,11 +730,45 @@ def queue_eligible_requests() -> int:
                 continue
             reason = "automatic" if row["support_level"] == "full" and row["authorized"] else "assisted"
             cur = conn.execute(
-                """INSERT OR IGNORE INTO runner_queue(request_id,created_at,run_after,status,reason)
-                VALUES(?,?,?,'queued',?)""", (row["id"], now, now, reason)
+                """INSERT OR IGNORE INTO runner_queue(request_id,created_at,run_after,status,reason,batch_id)
+                VALUES(?,?,?,'queued',?,?)""", (row["id"], now, now, reason, batch_id)
             )
             count += cur.rowcount
     return count
+
+
+def complete_finished_runs() -> int:
+    """Close runs only when every included queue row has reached an outcome."""
+    completed = 0
+    with db() as conn:
+        runs = conn.execute("SELECT id FROM automation_runs WHERE status='running'").fetchall()
+        for run in runs:
+            active = conn.execute(
+                "SELECT COUNT(*) FROM runner_queue WHERE batch_id=? AND status IN ('queued','running')",
+                (run["id"],),
+            ).fetchone()[0]
+            if active:
+                continue
+            rows = [dict(row) for row in conn.execute(
+                """SELECT r.*,q.status queue_status,q.run_after,q.last_error
+                FROM runner_queue q JOIN requests r ON r.id=q.request_id
+                WHERE q.batch_id=?""", (run["id"],)
+            )]
+            counts = {state: 0 for state in PARENT_STATES}
+            for row in rows:
+                job = {"status": row.pop("queue_status"), "run_after": row.pop("run_after")}
+                counts[resolve_parent_state(row, job)] += 1
+            conn.execute(
+                """UPDATE automation_runs SET finished_at=?,total=?,protected=?,sent=?,retrying=?,
+                help_needed=?,archived=?,status='complete' WHERE id=?""",
+                (utcnow(), len(rows), counts["protected"], counts["sent"],
+                 counts["queued"] + counts["retrying"], counts["help_needed"], counts["archived"], run["id"]),
+            )
+            completed += 1
+    if completed and setting("notification_run_complete") == "1":
+        create_notification("run_complete", "Privacy check complete",
+                            "The latest check finished and every company reached a clear outcome.")
+    return completed
 
 
 def record_submission_transaction(
@@ -872,6 +1016,28 @@ def refresh_due_statuses() -> None:
         )
 
 
+def create_notification(kind: str, title: str, detail: str, request_id: int | None = None) -> None:
+    with db() as conn:
+        duplicate = conn.execute(
+            """SELECT 1 FROM notifications WHERE kind=? AND title=? AND COALESCE(request_id,0)=COALESCE(?,0)
+            AND read_at IS NULL LIMIT 1""", (kind, title[:200], request_id)
+        ).fetchone()
+        if not duplicate:
+            conn.execute(
+                """INSERT INTO notifications(created_at,kind,title,detail,request_id)
+                VALUES(?,?,?,?,?)""",
+                (utcnow(), kind, title[:200], detail[:1000], request_id),
+            )
+
+
+def latest_run_receipt() -> dict[str, Any] | None:
+    with db() as conn:
+        row = conn.execute(
+            "SELECT * FROM automation_runs WHERE status='complete' ORDER BY finished_at DESC LIMIT 1"
+        ).fetchone()
+    return dict(row) if row else None
+
+
 @app.on_event("startup")
 def startup() -> None:
     init_db()
@@ -890,14 +1056,9 @@ def home(request: Request):
         return RedirectResponse("/welcome", status_code=303)
     refresh_due_statuses()
     requests = get_requests()
-    next_task = next((r for r in requests if r["status"] in {"prepared", "verification_due"}), None)
-    summary = {
-        "total": len(requests),
-        "prepared": sum(r["status"] == "prepared" for r in requests),
-        "waiting": sum(r["status"] == "waiting" for r in requests),
-        "done": sum(r["status"] in {"removed", "not_found"} for r in requests),
-        "attention": sum(r["status"] == "verification_due" for r in requests),
-    }
+    parent = parent_status_model()
+    next_task = parent["groups"]["help_needed"][0] if parent["groups"]["help_needed"] else None
+    summary = {"total": parent["total"], **parent["counts"]}
     exposure_findings = get_exposure_findings()
     summary["exposures"] = sum(item["status"] in {"new", "acting"} for item in exposure_findings)
     summary["registry"] = registry_summary()
@@ -906,8 +1067,37 @@ def home(request: Request):
         request, "dashboard.html",
         {"profile": p, "requests": requests, "next_task": next_task, "summary": summary,
          "identity_variants": get_identity_variants(), "exposure_findings": exposure_findings[:3],
-         "automation": automation},
+         "automation": automation, "parent": parent, "receipt": latest_run_receipt()},
     )
+
+
+@app.get("/help-needed", response_class=HTMLResponse)
+def help_needed(request: Request):
+    parent = parent_status_model()
+    item = parent["groups"]["help_needed"][0] if parent["groups"]["help_needed"] else None
+    return templates.TemplateResponse(request, "help_needed.html", {
+        "item": item, "remaining": parent["counts"]["help_needed"],
+    })
+
+
+@app.post("/help-needed/{request_id}/retry")
+def help_needed_retry(request_id: int):
+    requeue_automation_request(request_id)
+    if _worker_control:
+        _worker_control("wake")
+    with db() as conn:
+        conn.execute("UPDATE notifications SET read_at=? WHERE request_id=? AND read_at IS NULL",
+                     (utcnow(), request_id))
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/recover")
+def recover_automation():
+    if _worker_control is None:
+        raise HTTPException(503, "Automatic recovery is unavailable in this runtime")
+    result = _worker_control("restart")
+    audit("automatic_recovery_requested", result.get("detail", "Worker restart requested"))
+    return RedirectResponse("/", status_code=303)
 
 
 @app.get("/automation", response_class=HTMLResponse)
@@ -1697,6 +1887,51 @@ def audit_page(request: Request):
         "catalog_version": CATALOG_VERSION,
         "submission_transactions": get_submission_transactions(),
     })
+
+
+@app.get("/history", response_class=HTMLResponse)
+def parent_history(request: Request):
+    with db() as conn:
+        runs = [dict(row) for row in conn.execute(
+            "SELECT * FROM automation_runs ORDER BY started_at DESC LIMIT 50"
+        )]
+        notifications = [dict(row) for row in conn.execute(
+            "SELECT * FROM notifications ORDER BY id DESC LIMIT 50"
+        )]
+    return templates.TemplateResponse(request, "history.html", {
+        "runs": runs, "notifications": notifications,
+    })
+
+
+@app.get("/settings", response_class=HTMLResponse)
+def parent_settings(request: Request):
+    return templates.TemplateResponse(request, "settings.html", {
+        "helper_enabled": setting("trusted_helper_enabled") == "1",
+        "helper_name": (profile() or {}).get("helper_name", ""),
+        "help_notifications": setting("notification_help_needed") == "1",
+        "run_notifications": setting("notification_run_complete") == "1",
+    })
+
+
+@app.post("/settings")
+def update_parent_settings(
+    trusted_helper_enabled: bool = Form(False),
+    notification_help_needed: bool = Form(False),
+    notification_run_complete: bool = Form(False),
+):
+    values = {
+        "trusted_helper_enabled": str(int(trusted_helper_enabled)),
+        "notification_help_needed": str(int(notification_help_needed)),
+        "notification_run_complete": str(int(notification_run_complete)),
+    }
+    with db() as conn:
+        for name, value in values.items():
+            conn.execute(
+                """INSERT INTO settings(key,value) VALUES(?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (name, value)
+            )
+    audit("parent_settings_updated", "Trusted helper and notification preferences updated")
+    return RedirectResponse("/settings?saved=1", status_code=303)
 
 
 @app.get("/export")
