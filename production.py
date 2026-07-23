@@ -16,7 +16,7 @@ import zipfile
 from email import policy as email_policy
 from email.parser import BytesParser
 from collections import defaultdict, deque
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote, urlsplit
 
@@ -33,7 +33,8 @@ from app import (
     DATA_DIR, DB_PATH, EVIDENCE_DIR, KEY_PATH, app, audit, db, decrypt, encrypt,
     get_identity_variants, profile, queue_eligible_requests, refresh_due_statuses,
     setting, sync_catalog_plan, utcnow, record_submission_transaction, record_failure_diagnostic,
-    store_automation_evidence, register_worker_control,
+    store_automation_evidence, register_worker_control, complete_finished_runs,
+    parent_status_model, create_notification,
 )
 from automation import adapter_for
 from automation import classify_mail, message_fingerprint
@@ -455,7 +456,8 @@ def audit_broker_catalog(client: httpx.Client | None = None) -> dict[str, int]:
 
 def run_automation_scheduler() -> dict[str, int]:
     """Prepare safe browser work; the extension executes it in the user's real session."""
-    queued = queue_eligible_requests()
+    run_id = secrets.token_hex(16)
+    queued = queue_eligible_requests(run_id)
     with db() as conn:
         attention = conn.execute(
             """SELECT COUNT(*) FROM requests WHERE automation_status
@@ -465,8 +467,40 @@ def run_automation_scheduler() -> dict[str, int]:
             """INSERT INTO settings(key,value) VALUES('automation_runner_last_run',?)
             ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (utcnow(),)
         )
+        if queued:
+            conn.execute(
+                """INSERT INTO automation_runs(id,started_at,total,status)
+                VALUES(?,?,?,'running')""", (run_id, utcnow(), queued)
+            )
+        tomorrow = (datetime.now(timezone.utc) + timedelta(days=1)).date().isoformat()
+        conn.execute(
+            """INSERT INTO settings(key,value) VALUES('next_protection_check',?)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (tomorrow,)
+        )
     audit("automation_runner", f"{queued} task(s) queued; {attention} exception(s) need attention")
     return {"queued": queued, "attention": attention}
+
+
+def recover_stalled_automation() -> dict[str, int]:
+    """Recover stale jobs and restart an unhealthy worker without user action."""
+    if browser_worker_supervisor is None:
+        return {"recovered": 0, "restarted": 0}
+    worker = getattr(browser_worker_supervisor, "_worker", None)
+    recovered = worker.store.recover_stale(minutes=10) if worker else 0
+    state = setting("browser_worker_state") or "offline"
+    heartbeat = setting("browser_worker_heartbeat") or ""
+    stale = False
+    if heartbeat:
+        try:
+            stale = datetime.fromisoformat(heartbeat.replace("Z", "+00:00")) < datetime.now(timezone.utc) - timedelta(minutes=2)
+        except ValueError:
+            stale = True
+    restarted = 0
+    if state == "failed" or (state in {"online", "starting", "initializing", "launching_browser"} and stale):
+        browser_worker_supervisor.restart()
+        restarted = 1
+        audit("worker_auto_recovered", "DataSniper restarted a stalled background worker")
+    return {"recovered": recovered, "restarted": restarted}
 
 
 def reconcile_mailbox(connection=None) -> dict[str, int | str]:
@@ -705,6 +739,16 @@ def monitor_loop() -> None:
             if os.environ.get("DATASNIPER_AUTOMATION_RUNNER", "1") == "1":
                 run_automation_scheduler()
                 reconcile_mailbox()
+                recover_stalled_automation()
+                complete_finished_runs()
+                parent = parent_status_model()
+                if parent["counts"]["help_needed"] and setting("notification_help_needed") == "1":
+                    first = parent["groups"]["help_needed"][0]
+                    create_notification(
+                        "help_needed", "One privacy request needs help",
+                        f"{first['broker_name']} needs one action before DataSniper can continue.",
+                        first["id"],
+                    )
             if os.environ.get("DATASNIPER_AUTOBACKUP", "1") == "1":
                 newest = max(BACKUP_DIR.glob("*.zip"), key=lambda p: p.stat().st_mtime, default=None)
                 if newest is None or time.time() - newest.stat().st_mtime > 7 * 86400:
