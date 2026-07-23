@@ -24,6 +24,24 @@ def test_name_only_never_authorizes_submission():
     assert reason == "match_needs_review"
 
 
+def test_authorized_safe_profile_form_can_upgrade_assisted_adapter():
+    adapter = adapter_for("unknown-broker", "https://broker.example/privacy")
+    assert adapter.level == "assisted"
+    assert may_submit(
+        "automatic", 0, False, adapter, True, safe_profile_form=True
+    ) == (True, "authorized")
+
+
+def test_safe_profile_form_still_requires_authorization_and_non_ask_policy():
+    adapter = adapter_for("unknown-broker", "https://broker.example/privacy")
+    assert may_submit(
+        "automatic", 0, False, adapter, False, safe_profile_form=True
+    ) == (False, "authorization_required")
+    assert may_submit(
+        "ask", 0, False, adapter, True, safe_profile_form=True
+    ) == (False, "approval_required")
+
+
 def test_adapter_policy_and_confirmation_detection():
     adapter = adapter_for("spokeo", "https://www.spokeo.com/optout")
     assert may_submit("high_confidence", 90, True, adapter, True) == (True, "authorized")

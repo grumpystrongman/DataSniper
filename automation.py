@@ -120,15 +120,23 @@ def match_identity(visible_text: str, profile: dict[str, str], variants: list[di
     return {"score": min(score, 100), "strong_identifier": strong, "signals": hits}
 
 
-def may_submit(policy: str, score: int, strong_identifier: bool, adapter: Adapter, authorized: bool) -> tuple[bool, str]:
+def may_submit(
+    policy: str,
+    score: int,
+    strong_identifier: bool,
+    adapter: Adapter,
+    authorized: bool,
+    *,
+    safe_profile_form: bool = False,
+) -> tuple[bool, str]:
     if policy not in AUTHORIZATION_POLICIES:
         return False, "invalid_policy"
-    if adapter.level != "full":
+    if adapter.level != "full" and not safe_profile_form:
         return False, "adapter_requires_assistance"
     if not authorized:
         return False, "authorization_required"
     registry_request = adapter.slug.startswith("registry-")
-    if (not registry_request and not strong_identifier) or score < adapter.minimum_match:
+    if not safe_profile_form and ((not registry_request and not strong_identifier) or score < adapter.minimum_match):
         return False, "match_needs_review"
     if policy == "ask" and not registry_request:
         return False, "approval_required"
