@@ -21,6 +21,9 @@ def form_profile(profile: dict[str, str]) -> dict[str, str]:
         result.setdefault("first_name", parts[0])
         result.setdefault("last_name", parts[-1] if len(parts) > 1 else "")
         result.setdefault("middle_name", " ".join(parts[1:-1]))
+    if result.get("email"):
+        result.setdefault("confirm_email", result["email"])
+        result.setdefault("email_confirmation", result["email"])
     result.setdefault("country", "United States")
     return result
 
@@ -95,6 +98,23 @@ class QueueStore:
         with self.db_factory() as conn:
             conn.execute("BEGIN IMMEDIATE")
             now = _now()
+            # Empty catalog URLs are a terminal data-quality outcome, not browser work.
+            conn.execute(
+                """UPDATE requests SET status='no_url',automation_status='not_applicable'
+                WHERE id IN (
+                  SELECT q.request_id FROM runner_queue q JOIN requests r ON r.id=q.request_id
+                  WHERE q.status='queued' AND TRIM(COALESCE(r.url,''))=''
+                )"""
+            )
+            conn.execute(
+                """UPDATE runner_queue SET status='cancelled',stage='no_url',
+                finished_at=?,heartbeat_at=?,worker_id=NULL,
+                last_error='NO URL — no official privacy-request URL is available'
+                WHERE status='queued' AND request_id IN (
+                  SELECT id FROM requests WHERE status='no_url'
+                )""",
+                (now, now),
+            )
             conn.execute(
                 """UPDATE runner_queue SET status='cancelled',stage='awaiting_email',
                 finished_at=?,heartbeat_at=?,worker_id=NULL,
@@ -112,7 +132,7 @@ class QueueStore:
                 last_error='Request already reached a terminal outcome'
                 WHERE status='queued' AND request_id IN (
                   SELECT id FROM requests
-                  WHERE status IN ('removed','not_found','archived')
+                  WHERE status IN ('removed','not_found','no_url','archived')
                      OR automation_status IN ('completed','not_applicable')
                 )""",
                 (now, now),
@@ -156,19 +176,25 @@ class QueueStore:
 
     def finish(self, job: dict[str, Any], result: BrowserResult) -> None:
         attempt_number = job.get("attempts", 0) + 1
+        no_url = result.outcome == "no_url" or bool(re.search(r"\bNO URL\b", result.detail, re.IGNORECASE))
         immediately_unaddressable = result.outcome == "unavailable" or bool(re.search(
             r"HTTP (404|410)\b|ERR_NAME_NOT_RESOLVED|ERR_INVALID_URL|"
             r"ERR_ADDRESS_INVALID|ERR_UNKNOWN_URL_SCHEME",
             result.detail,
             re.IGNORECASE,
         ))
-        permanent_url_failure = immediately_unaddressable or (
+        exhausted_bad_endpoint = attempt_number >= 2 and bool(re.search(
+            r"ERR_CERT_COMMON_NAME_INVALID|ERR_SSL_PROTOCOL_ERROR|ERR_TOO_MANY_REDIRECTS",
+            result.detail,
+            re.IGNORECASE,
+        ))
+        permanent_url_failure = no_url or immediately_unaddressable or exhausted_bad_endpoint or (
             attempt_number >= 3
             and bool(re.search(r"ERR_CONNECTION_REFUSED", result.detail, re.IGNORECASE))
         )
         transient_failure = bool(re.search(
-            r"HTTP 5\d\d|timeout|timed out|ERR_CONNECTION_(?:RESET|CLOSED|TIMED_OUT)|"
-            r"temporar|network|connection reset",
+            r"HTTP 5\d\d|HTTP 403|timeout|timed out|ERR_ABORTED|"
+            r"ERR_CONNECTION_(?:RESET|CLOSED|TIMED_OUT)|temporar|network|connection reset",
             result.detail,
             re.IGNORECASE,
         ))
@@ -188,7 +214,7 @@ class QueueStore:
         status = {
             "submitted": "awaiting_response", "confirmed": "completed", "blocked": "human_action_required",
             "needs_review": "human_action_required", "failed": "failed", "no_match": "not_applicable",
-            "unavailable": "not_applicable",
+            "unavailable": "not_applicable", "no_url": "not_applicable",
         }.get(result.outcome, result.outcome)
         if permanent_url_failure:
             status = "not_applicable"
@@ -200,21 +226,26 @@ class QueueStore:
         retry_at = (datetime.now(timezone.utc) + timedelta(minutes=5 * (2 ** (attempt_number - 1)))).replace(
             microsecond=0
         ).isoformat().replace("+00:00", "Z")
+        terminal_stage = "no_url" if no_url else "archived"
+        terminal_prefix = (
+            "NO URL — " if no_url else "Archived: Not addressed because official URL is unavailable — "
+        )
         with self.db_factory() as conn:
             conn.execute(
                 """UPDATE runner_queue SET status=?,stage=?,finished_at=?,heartbeat_at=?,last_error=?,
                 run_after=?,worker_id=?
                 WHERE id=? AND worker_id=?""",
-                (queue_state, "archived" if permanent_url_failure else ("retry_scheduled" if retryable_failure else result.stage),
+                (queue_state, terminal_stage if permanent_url_failure else ("retry_scheduled" if retryable_failure else result.stage),
                  None if retryable_failure else now, now,
-                 ((("Archived: Not addressed because official URL is unavailable — " if permanent_url_failure else "") + result.detail)[:1000]
+                 (((terminal_prefix if permanent_url_failure else "") + result.detail)[:1000]
                   if queue_state != "completed" else ""), retry_at if retryable_failure else now,
                  None if retryable_failure else self.worker_id, job["queue_id"], self.worker_id),
             )
             if permanent_url_failure:
+                request_status = "no_url" if no_url else "not_found"
                 conn.execute(
-                    "UPDATE requests SET status='not_found',automation_status=? WHERE id=?",
-                    (status, job["request_id"]),
+                    "UPDATE requests SET status=?,automation_status=? WHERE id=?",
+                    (request_status, status, job["request_id"]),
                 )
             else:
                 conn.execute("UPDATE requests SET automation_status=? WHERE id=?", (status, job["request_id"]))
