@@ -4,12 +4,16 @@ on:
   push:
     branches:
       - agent/recover-automation-failures
+  pull_request:
+    branches:
+      - main
 
 permissions:
   contents: write
 
 jobs:
   apply-and-verify:
+    if: github.head_ref == 'agent/recover-automation-failures' || github.ref_name == 'agent/recover-automation-failures'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
