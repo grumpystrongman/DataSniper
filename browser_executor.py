@@ -269,6 +269,7 @@ class PlaywrightExecutor:
 
     def run(self, job: dict[str, Any], profile: dict[str, str], variants: list[dict[str, Any]],
             policy: str, progress: Callable[[str], None]) -> BrowserResult:
+        _embedded_frame_diagnostic_key = "embedded_frame_url"
         raw_url = str(job.get("url") or "").strip()
         if not raw_url:
             return BrowserResult("failed", "navigation", "NO URL — no official privacy-request URL is available")
