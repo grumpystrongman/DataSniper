@@ -33,6 +33,12 @@ class BrowserWorker:
         """Interrupt the idle poll wait when an operator schedules work."""
         self.wake_event.set()
 
+    def _worker_status(self, state: str, detail: str = "") -> None:
+        """Update live status when the configured store supports worker metadata."""
+        status_fn = getattr(self.store, "worker_status", None)
+        if status_fn:
+            status_fn(state, detail)
+
     @staticmethod
     def _site_detail(job: dict[str, Any], state: str = "") -> str:
         broker = str(job.get("broker_name") or "Unknown broker").strip()
@@ -58,7 +64,7 @@ class BrowserWorker:
         if not job:
             return False
         claimed_detail = self._site_detail(job, "claimed")
-        self.store.worker_status("online", claimed_detail)
+        self._worker_status("online", claimed_detail)
         operational_event("browser_worker_claimed", claimed_detail)
         self.record_fn(
             job["request_id"], "discovery", "started",
@@ -68,7 +74,7 @@ class BrowserWorker:
         def report_progress(state: str) -> None:
             detail = self._site_detail(job, state)
             self.store.progress(job, state, detail)
-            self.store.worker_status("online", detail)
+            self._worker_status("online", detail)
             operational_event("browser_worker_progress", detail)
 
         try:
@@ -117,7 +123,7 @@ class BrowserWorker:
                 )
                 operational_event("browser_attention", self._attention_payload(job, result))
             self.store.finish(job, result)
-            self.store.worker_status(
+            self._worker_status(
                 "online",
                 f"Finished {job['broker_name']} — {result.outcome.replace('_', ' ')}; checking the next queued site",
             )
@@ -141,7 +147,7 @@ class BrowserWorker:
             )
             operational_event("browser_attention", self._attention_payload(job, result))
             self.store.finish(job, result)
-            self.store.worker_status(
+            self._worker_status(
                 "online",
                 f"Failed {job['broker_name']} — {result.page_url or 'URL unavailable'} — {detail[:250]}",
             )
