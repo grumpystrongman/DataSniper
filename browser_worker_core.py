@@ -48,6 +48,21 @@ class QueueStore:
     def recover_stale(self, minutes: int = 15) -> int:
         cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).replace(microsecond=0).isoformat().replace("+00:00", "Z")
         with self.db_factory() as conn:
+            # Restore URL failures that older DataSniper versions auto-archived.
+            # Explicit operator archives use different text and remain untouched.
+            conn.execute(
+                """UPDATE requests SET status='prepared',automation_status='failed'
+                WHERE id IN (
+                  SELECT request_id FROM runner_queue
+                  WHERE status='cancelled' AND stage='archived'
+                    AND last_error LIKE 'Archived: Not addressed because official URL is unavailable — %'
+                )"""
+            )
+            conn.execute(
+                """UPDATE runner_queue SET status='failed',stage='navigation',worker_id=NULL
+                WHERE status='cancelled' AND stage='archived'
+                  AND last_error LIKE 'Archived: Not addressed because official URL is unavailable — %'"""
+            )
             stale = conn.execute(
                 """SELECT id,request_id FROM runner_queue WHERE status='running'
                 AND COALESCE(heartbeat_at,started_at) < ?""", (cutoff,)
