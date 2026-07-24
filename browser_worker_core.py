@@ -80,10 +80,15 @@ class QueueStore:
                 "SELECT value FROM settings WHERE key='browser_worker_state'"
             ).fetchone()
             transition_at = _now() if not previous or previous["value"] != state else None
-            for key, value in (
-                ("browser_worker_state", state), ("browser_worker_heartbeat", _now()),
-                ("browser_worker_detail", detail[:500]), ("browser_worker_id", self.worker_id),
-            ):
+            values = [
+                ("browser_worker_state", state),
+                ("browser_worker_heartbeat", _now()),
+                ("browser_worker_id", self.worker_id),
+            ]
+            # Empty heartbeat updates must not erase the current broker/URL.
+            if detail:
+                values.append(("browser_worker_detail", detail[:500]))
+            for key, value in values:
                 conn.execute(
                     "INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                     (key, value),
@@ -167,7 +172,7 @@ class QueueStore:
         with self.db_factory() as conn:
             conn.execute(
                 "UPDATE runner_queue SET stage=?,heartbeat_at=?,last_error=? WHERE id=? AND worker_id=?",
-                (state, now, detail[:1000] if state == "failed" else "", job["queue_id"], self.worker_id),
+                (state, now, detail[:1000], job["queue_id"], self.worker_id),
             )
             conn.execute(
                 "UPDATE requests SET automation_status=? WHERE id=?",
@@ -188,9 +193,20 @@ class QueueStore:
             result.detail,
             re.IGNORECASE,
         ))
-        permanent_url_failure = no_url or immediately_unaddressable or exhausted_bad_endpoint or (
-            attempt_number >= 3
-            and bool(re.search(r"ERR_CONNECTION_REFUSED", result.detail, re.IGNORECASE))
+        # Classified navigation failures must stay visible until the operator
+        # explicitly archives them. Legacy top-level worker exceptions retain
+        # the prior archival behavior so interrupted/corrupt attempts do not
+        # endlessly churn without a classified BrowserResult.
+        permanent_url_failure = no_url or (
+            result.stage != "navigation"
+            and (
+                immediately_unaddressable
+                or exhausted_bad_endpoint
+                or (
+                    attempt_number >= 3
+                    and bool(re.search(r"ERR_CONNECTION_REFUSED", result.detail, re.IGNORECASE))
+                )
+            )
         )
         transient_failure = bool(re.search(
             r"HTTP 5\d\d|HTTP 403|timeout|timed out|ERR_ABORTED|"
@@ -230,6 +246,12 @@ class QueueStore:
         terminal_prefix = (
             "NO URL — " if no_url else "Archived: Not addressed because official URL is unavailable — "
         )
+        site_parts = [
+            str(job.get("broker_name") or "").strip(),
+            str(result.page_url or job.get("url") or "").strip(),
+        ]
+        site_context = " — ".join(part for part in site_parts if part)
+        actionable_detail = f"{site_context} — {result.detail}" if site_context else result.detail
         with self.db_factory() as conn:
             conn.execute(
                 """UPDATE runner_queue SET status=?,stage=?,finished_at=?,heartbeat_at=?,last_error=?,
@@ -237,7 +259,7 @@ class QueueStore:
                 WHERE id=? AND worker_id=?""",
                 (queue_state, terminal_stage if permanent_url_failure else ("retry_scheduled" if retryable_failure else result.stage),
                  None if retryable_failure else now, now,
-                 (((terminal_prefix if permanent_url_failure else "") + result.detail)[:1000]
+                 (((terminal_prefix if permanent_url_failure else "") + actionable_detail)[:1000]
                   if queue_state != "completed" else ""), retry_at if retryable_failure else now,
                  None if retryable_failure else self.worker_id, job["queue_id"], self.worker_id),
             )
