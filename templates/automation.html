@@ -42,6 +42,19 @@
     <div><div class="metric">{{ overview.attention }}</div><div class="muted">need attention</div></div>
   </div>
 </div>
+<div class="card" id="operator-assist-card">
+  <h2>Local AI guidance and CAPTCHA session permission</h2>
+  <p id="ai-guidance-summary" class="muted">Loading recent local-AI activity…</p>
+  <div class="actions">
+    <button type="button" id="captcha-assist-toggle" data-enabled="false">Turn on human CAPTCHA assistance for this session</button>
+    <strong id="captcha-assist-state">Off</strong>
+  </div>
+  <p class="muted">This permission exists only in memory until DataSniper restarts. When enabled, the worker restarts in a visible browser and pauses at a CAPTCHA so you can complete it. DataSniper does not solve, outsource, or bypass the challenge.</p>
+  <div id="captcha-assist-message" role="status" aria-live="polite"></div>
+  <h3>Recent private AI decisions</h3>
+  <p class="muted">These records show what the model saw, what it recommended, and whether DataSniper applied the recommendation. Household profile values are never included.</p>
+  <div id="ai-decision-traces"><p>Loading decision evidence…</p></div>
+</div>
 {% set group_labels = {
   'attention': ('Your action needed', 'CAPTCHAs, legal fields, missing information, and ambiguous forms you can unblock.'),
   'running': ('Running now', 'The background browser is actively inspecting or submitting these requests.'),
@@ -153,7 +166,7 @@
 </div>
 <div class="card">
   <h2>Authorization policy</h2>
-  <p class="muted">A broker must also be authorized below before DataSniper can submit. CAPTCHA, ID upload, consent, and legal attestations always pause.</p>
+  <p class="muted">A broker must also be authorized below before DataSniper can submit. ID upload, consent, and legal attestations always pause. CAPTCHAs pause unless you explicitly enable human completion for the current session; DataSniper never solves them automatically.</p>
   <form method="post" action="/automation/policy">
     <select name="policy">
       <option value="ask" {% if policy == 'ask' %}selected{% endif %}>Always ask before submission</option>
@@ -203,6 +216,11 @@
   const checked=document.querySelector('#worker-checked');
   const elapsed=document.querySelector('#worker-elapsed');
   const liveJobs=document.querySelector('#live-jobs');
+  const assistSummary=document.querySelector('#ai-guidance-summary');
+  const traceContainer=document.querySelector('#ai-decision-traces');
+  const captchaButton=document.querySelector('#captcha-assist-toggle');
+  const captchaState=document.querySelector('#captcha-assist-state');
+  const captchaMessage=document.querySelector('#captcha-assist-message');
   const escapeText=value=>String(value??'');
   const renderJobs=jobs=>{
     liveJobs.replaceChildren();
@@ -225,6 +243,79 @@
     health.append(strong,document.createTextNode(detail));
     health.className=isOnline?'good':'notice';
   };
+  const appendLine=(parent,label,value)=>{
+    if(value===undefined||value===null||value==='')return;
+    const line=document.createElement('div');
+    const strong=document.createElement('strong');strong.textContent=`${label}: `;
+    line.append(strong,document.createTextNode(escapeText(value)));
+    parent.append(line);
+  };
+  const renderTraces=traces=>{
+    traceContainer.replaceChildren();
+    if(!traces.length){const p=document.createElement('p');p.textContent='No browser attempts have produced an AI trace yet.';traceContainer.append(p);return;}
+    traces.forEach(trace=>{
+      const row=document.createElement('div');row.className='task-row';
+      const detail=document.createElement('div');detail.className='details';
+      const title=document.createElement('strong');title.textContent=escapeText(trace.broker_name);
+      const usage=document.createElement('span');usage.className=`status ${trace.used?'completed':'attention'}`;usage.textContent=trace.used?'local AI used':'AI not used';
+      detail.append(title,document.createElement('br'),usage,document.createTextNode(` · ${escapeText(trace.event_at)}`));
+      if(trace.used){
+        appendLine(detail,'Decision',`${escapeText(trace.next_action).replaceAll('_',' ')} · ${Math.round(Number(trace.confidence||0)*100)}% confidence`);
+        appendLine(detail,'Applied',trace.applied?`${escapeText(trace.application).replaceAll('_',' ')}`:`No — ${escapeText(trace.application||'recommendation recorded only').replaceAll('_',' ')}`);
+        appendLine(detail,'Model evidence',(trace.evidence||[]).join(' | '));
+        appendLine(detail,'Explanation',trace.explanation);
+        const mappings=(trace.field_mappings||[]).map(item=>`${escapeText(item.profile_key)} ← control ${escapeText(item.control_index)}`);
+        appendLine(detail,'Field mappings',mappings.join(', '));
+        appendLine(detail,'Selected link',trace.target_link_index?`link ${trace.target_link_index}`:'');
+        appendLine(detail,'Vision screenshot',trace.vision_used?'analyzed locally':'not used');
+      } else {
+        appendLine(detail,'Reason',trace.not_used_reason);
+      }
+      const outcome=document.createElement('small');outcome.textContent=`${escapeText(trace.stage).replaceAll('_',' ')} · ${escapeText(trace.outcome).replaceAll('_',' ')}`;
+      row.append(detail,outcome);traceContainer.append(row);
+    });
+  };
+  const pollAssist=async()=>{
+    try{
+      const response=await fetch('/automation/assist/status',{headers:{Accept:'application/json'},cache:'no-store'});
+      if(!response.ok)throw new Error(`status ${response.status}`);
+      const data=await response.json();
+      const summary=data.summary||{};
+      const ai=data.local_ai||{};
+      assistSummary.textContent=`Local model ${ai.model||'not configured'} · used in ${summary.ai_used||0} of ${summary.recent_jobs||0} recent browser attempt(s). ${ai.detail||''}`;
+      const captcha=data.captcha_assist||{};
+      captchaButton.dataset.enabled=captcha.enabled?'true':'false';
+      captchaButton.textContent=captcha.enabled?'Turn off human CAPTCHA assistance':'Turn on human CAPTCHA assistance for this session';
+      captchaButton.className=captcha.enabled?'secondary':'';
+      captchaState.textContent=captcha.enabled?'On for this session':'Off';
+      renderTraces(data.traces||[]);
+    }catch(error){
+      assistSummary.textContent='Operator-assist status is unavailable. Restart the application after updating DataSniper.';
+      traceContainer.replaceChildren();
+      const p=document.createElement('p');p.textContent='AI decision evidence could not be loaded.';traceContainer.append(p);
+    }
+  };
+  captchaButton.addEventListener('click',async()=>{
+    const enable=captchaButton.dataset.enabled!=='true';
+    if(enable&&!window.confirm('Enable a visible browser for this application session? DataSniper will pause at CAPTCHAs, but you must complete each challenge yourself.'))return;
+    captchaButton.disabled=true;
+    captchaMessage.className='notice';
+    captchaMessage.textContent=enable?'Enabling session permission and restarting the browser worker…':'Disabling session permission and restarting the browser worker…';
+    try{
+      const body=new URLSearchParams({enabled:String(enable)});
+      const response=await fetch('/automation/assist/captcha',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded',Accept:'application/json'},body});
+      if(!response.ok)throw new Error(`status ${response.status}`);
+      const data=await response.json();
+      captchaMessage.className=data.captcha_assist?.enabled?'good':'notice';
+      captchaMessage.textContent=`${data.message||''} Worker: ${data.worker?.detail||data.worker?.state||'updated'}`;
+      await pollAssist();
+    }catch(error){
+      captchaMessage.className='notice';
+      captchaMessage.textContent='The CAPTCHA session permission could not be changed.';
+    }finally{
+      captchaButton.disabled=false;
+    }
+  });
   const poll=async()=>{
     try {
       const response=await fetch('/automation/status',{headers:{Accept:'application/json'},cache:'no-store'});
@@ -253,7 +344,9 @@
     }
   };
   poll();
+  pollAssist();
   setInterval(poll,2000);
+  setInterval(pollAssist,5000);
 })();
 </script>
 {% endblock %}
