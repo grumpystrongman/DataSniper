@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from browser_executor import PlaywrightExecutor as BasePlaywrightExecutor
 from browser_resilience import (
     ResilientBrowserWorker,
     ResilientPlaywrightExecutor,
@@ -98,6 +99,30 @@ def test_navigation_timeout_retries_with_commit():
     assert len(attempts) == 1
     assert page.calls[0][1] == "domcontentloaded"
     assert page.calls[1][1] == "commit"
+
+
+def test_run_restores_attempted_url_after_browser_error_page(monkeypatch):
+    def failed_run(self, job, profile, variants, policy, progress):
+        return BrowserResult(
+            "failed",
+            "navigation",
+            'Navigation is interrupted by another navigation to "chrome-error://chromewebdata/"',
+            page_url="about:blank",
+            diagnostics={"detected": {}, "attempted": {}},
+        )
+
+    monkeypatch.setattr(BasePlaywrightExecutor, "run", failed_run)
+    executor = ResilientPlaywrightExecutor(SimpleNamespace())
+    result = executor.run(
+        {"url": "https://example.test/privacy"},
+        {},
+        [],
+        "ask",
+        lambda state: None,
+    )
+
+    assert result.page_url == "https://example.test/privacy"
+    assert result.diagnostics["detected"]["failure_category"] == "navigation_interrupted"
 
 
 def test_worker_writes_failure_category_as_diagnostic_stage():
