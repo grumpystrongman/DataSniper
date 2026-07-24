@@ -25,13 +25,17 @@ UNREACHABLE_FAILURE_CATEGORIES = {
     "site_certificate_error",
     "redirect_loop",
     "connection_failed",
+    "page_load_timeout",
+    "site_server_error",
+    "navigation_failed",
 }
 _UNREACHABLE_DETAIL = re.compile(
     r"ERR_NAME_NOT_RESOLVED|ERR_INVALID_URL|ERR_ADDRESS_INVALID|ERR_UNKNOWN_URL_SCHEME|"
-    r"HTTP\s+(?:404|410)\b|ERR_CERT_[A-Z0-9_]+|ERR_SSL_PROTOCOL_ERROR|"
+    r"HTTP\s+(?:404|410|5\d\d)\b|ERR_CERT_[A-Z0-9_]+|ERR_SSL_PROTOCOL_ERROR|"
     r"ERR_TOO_MANY_REDIRECTS|ERR_CONNECTION_(?:REFUSED|RESET|CLOSED|TIMED_OUT)|"
     r"host could not be found|page was not found|page has been retired|"
-    r"certificate is invalid|redirect loop|refused or dropped the connection",
+    r"certificate is invalid|redirect loop|refused or dropped the connection|"
+    r"timed out before it became usable|temporary server error|could not open the privacy page",
     re.IGNORECASE,
 )
 
