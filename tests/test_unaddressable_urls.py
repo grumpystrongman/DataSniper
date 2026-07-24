@@ -97,3 +97,41 @@ def test_bad_or_missing_url_remains_visible_for_operator_review(tmp_path, detail
     assert detail in queue["last_error"]
     assert active == 0
     assert store.claim() is None
+
+
+def test_legacy_auto_archived_url_is_restored(tmp_path):
+    database = tmp_path / "queue.db"
+    initialize_queue(database)
+
+    def db_factory():
+        return database_factory(database)
+
+    automatic = (
+        "Archived: Not addressed because official URL is unavailable — "
+        "Gone Broker — https://gone.invalid/privacy — Page.goto: net::ERR_NAME_NOT_RESOLVED"
+    )
+    with db_factory() as conn:
+        conn.execute(
+            "UPDATE requests SET status='not_found',automation_status='not_applicable' WHERE id=1"
+        )
+        conn.execute(
+            """UPDATE runner_queue SET status='cancelled',stage='archived',worker_id=NULL,
+            finished_at=?,last_error=? WHERE id=1""",
+            (_now(), automatic),
+        )
+
+    store = QueueStore(db_factory, "test-worker")
+    assert store.recover_stale() == 0
+
+    with db_factory() as conn:
+        request = conn.execute(
+            "SELECT status,automation_status FROM requests WHERE id=1"
+        ).fetchone()
+        queue = conn.execute(
+            "SELECT status,stage,last_error FROM runner_queue WHERE id=1"
+        ).fetchone()
+
+    assert dict(request) == {"status": "prepared", "automation_status": "failed"}
+    assert queue["status"] == "failed"
+    assert queue["stage"] == "navigation"
+    assert queue["last_error"] == automatic
