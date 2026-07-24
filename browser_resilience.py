@@ -1,7 +1,9 @@
-"""Targeted browser recovery and stable failure labels for privacy workflows."""
+"""Targeted browser recovery, proactive local-AI guidance, and stable failure labels."""
 from __future__ import annotations
 
+import os
 import re
+import time
 from typing import Any, Callable
 from urllib.parse import urlsplit, urlunsplit
 
@@ -16,6 +18,37 @@ _CONTEXT_DESTROYED = re.compile(
     r"cannot find context with specified id|frame was detached",
     re.IGNORECASE,
 )
+
+_PAGE_GUIDANCE_SCRIPT = r"""() => {
+  const clean=value=>String(value||'').replace(/\s+/g,' ').trim().slice(0,240);
+  const describe=e=>clean(`${e.name||''} ${e.id||''} ${e.placeholder||''} ${e.getAttribute('aria-label')||''} ${e.labels?[...e.labels].map(x=>x.innerText).join(' '):''}`);
+  const controls=[...document.querySelectorAll('input,textarea,select')]
+    .filter(e=>!e.disabled&&e.type!=='hidden').slice(0,100).map((el,index)=>({
+      index:index+1,
+      type:el.tagName==='SELECT'?'select':el.tagName==='TEXTAREA'?'textarea':(el.type||'input'),
+      label:describe(el),required:!!el.required,
+      options:el.tagName==='SELECT'?[...el.options].slice(0,30).map(o=>clean(o.text)).filter(Boolean):[],
+    }));
+  const links=[...document.querySelectorAll('a[href]')].filter(el=>{
+    const rect=el.getBoundingClientRect();return rect.width>0&&rect.height>0;
+  }).slice(0,100).map((el,index)=>{
+    let href='';let sameOrigin=false;
+    try{const target=new URL(el.href,location.href);href=target.href;sameOrigin=target.origin===location.origin;}catch{}
+    return {index:index+1,label:clean(`${el.innerText||''} ${el.getAttribute('aria-label')||''}`),href:clean(href),same_origin:sameOrigin};
+  });
+  const visible=(document.body?.innerText||'').toLowerCase();
+  const captcha=!!document.querySelector('iframe[src*="captcha" i],.g-recaptcha,[class*="captcha" i],[id*="captcha" i],[data-sitekey]')||/verify you are human|complete the captcha|security challenge|checking for any bots/.test(visible);
+  return {
+    page_title:clean(document.title),
+    headings:[...document.querySelectorAll('h1,h2,h3,legend')].slice(0,25).map(e=>clean(e.innerText)).filter(Boolean),
+    controls,links,detected:{captcha},
+  };
+}"""
+
+_CAPTCHA_PRESENT_SCRIPT = r"""() => {
+  const visible=(document.body?.innerText||'').toLowerCase();
+  return !!document.querySelector('iframe[src*="captcha" i],.g-recaptcha,[class*="captcha" i],[id*="captcha" i],[data-sitekey]')||/verify you are human|complete the captcha|security challenge|checking for any bots/.test(visible);
+}"""
 
 
 def classify_browser_failure(detail: str, *, default_stage: str = "navigation") -> tuple[str, str]:
@@ -92,7 +125,36 @@ def _failure_code(detail: str) -> str:
 
 
 class ResilientPlaywrightExecutor(BasePlaywrightExecutor):
-    """Add bounded recovery while keeping the base executor guardrails intact."""
+    """Add bounded recovery and make the private model an active page planner."""
+
+    def __init__(self, intelligence: Any | None = None):
+        super().__init__(intelligence)
+        self._guided_page_keys: set[str] = set()
+        self._captcha_waited: set[str] = set()
+
+    def start(self) -> None:
+        """Launch visibly only when the operator enabled CAPTCHA assistance this session."""
+        from playwright.sync_api import sync_playwright
+        try:
+            from operator_assist import captcha_assist_enabled
+            human_captcha = captcha_assist_enabled()
+        except Exception:
+            human_captcha = False
+        self._playwright = sync_playwright().start()
+        configured_headless = os.environ.get("DATASNIPER_BROWSER_HEADLESS", "1") != "0"
+        self._browser = self._playwright.chromium.launch(headless=configured_headless and not human_captcha)
+        user_agent = os.environ.get(
+            "DATASNIPER_BROWSER_USER_AGENT",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+        )
+        self._context = self._browser.new_context(
+            ignore_https_errors=False,
+            user_agent=user_agent,
+            locale="en-US",
+            viewport={"width": 1365, "height": 900},
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
+        )
 
     @staticmethod
     def _reset_page(page: Any) -> None:
@@ -182,6 +244,195 @@ class ResilientPlaywrightExecutor(BasePlaywrightExecutor):
     @staticmethod
     def _context_failure(exc: Exception) -> bool:
         return bool(_CONTEXT_DESTROYED.search(f"{type(exc).__name__}: {exc}"))
+
+    @staticmethod
+    def _proposal_record(proposal: Any) -> dict[str, Any]:
+        record = BasePlaywrightExecutor._proposal_record(proposal)
+        record["evidence"] = list(getattr(proposal, "evidence", ()) or ())
+        record["vision_used"] = True
+        record["guidance_role"] = "page_navigation_and_form_mapping"
+        return record
+
+    @staticmethod
+    def _attach_ai(candidate: dict[str, Any], proposal_record: dict[str, Any], history: list[dict[str, Any]],
+                   *, applied: bool, application: str) -> dict[str, Any]:
+        diagnostics = candidate.setdefault("diagnostics", {})
+        detected = diagnostics.setdefault("detected", {})
+        existing = list(detected.get("local_intelligence_attempts") or [])
+        combined = existing + list(history)
+        unique: list[dict[str, Any]] = []
+        seen: set[tuple[Any, ...]] = set()
+        for item in combined:
+            key = (
+                item.get("next_action"), item.get("target_link_index"),
+                item.get("explanation"), item.get("guidance_role"),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            unique.append(item)
+        result = BasePlaywrightExecutor._attach_ai(
+            candidate, proposal_record, unique, applied=applied, application=application,
+        )
+        result.setdefault("diagnostics", {}).setdefault("detected", {})["ai_vision_used"] = True
+        return result
+
+    def _snapshot(self, page: Any) -> dict[str, Any] | None:
+        for attempt in range(2):
+            try:
+                return page.evaluate(_PAGE_GUIDANCE_SCRIPT)
+            except Exception as exc:
+                if not self._context_failure(exc):
+                    return None
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=5_000)
+                    page.wait_for_timeout(350 * (attempt + 1))
+                except Exception:
+                    pass
+        return None
+
+    def _guide_page(self, page: Any, aliases: dict[str, Any], allowed_hosts: set[str]) -> tuple[
+        list[dict[str, Any]], dict[str, Any] | None, bool, str
+    ]:
+        """Ask the local model before deterministic actions and apply only guarded proposals."""
+        history: list[dict[str, Any]] = []
+        applications: list[str] = []
+        applied = False
+        for _ in range(2):
+            snapshot = self._snapshot(page)
+            if not snapshot:
+                break
+            key = f"{page.url}|{snapshot.get('page_title', '')}"
+            if key in self._guided_page_keys:
+                break
+            self._guided_page_keys.add(key)
+            if (snapshot.get("detected") or {}).get("captcha"):
+                break
+            if not self.intelligence.health():
+                break
+            proposal = self.intelligence.evaluate(
+                url=page.url,
+                title=str(snapshot.get("page_title", "")),
+                headings=list(snapshot.get("headings", [])),
+                controls=list(snapshot.get("controls", [])),
+                links=list(snapshot.get("links", [])),
+                attempt_history=history,
+                screenshot=self._screenshot(page),
+            )
+            if not proposal:
+                break
+            record = self._proposal_record(proposal)
+            target = next(
+                (item for item in snapshot.get("links", []) if item.get("index") == proposal.target_link_index),
+                None,
+            )
+            if target:
+                record["selected_link_label"] = str(target.get("label") or "")[:240]
+                record["selected_link_url"] = str(target.get("href") or "")[:500]
+            history.append(record)
+
+            learned_aliases, learned = self._merge_aliases(
+                aliases, list(snapshot.get("controls", [])), proposal.field_mappings,
+            )
+            if learned:
+                aliases.clear()
+                aliases.update(learned_aliases)
+                applications.append(f"learned_{learned}_field_aliases")
+                applied = True
+
+            if proposal.next_action == "open_privacy_link" and proposal.confidence >= 0.90:
+                opened, application = self._follow_model_link(page, snapshot, proposal, allowed_hosts)
+                applications.append(application)
+                applied = applied or opened
+                if opened:
+                    page.wait_for_timeout(700)
+                    continue
+            elif proposal.next_action == "continue_deterministic":
+                applications.append("ai_validated_current_page")
+            elif proposal.next_action == "fill_without_submitting":
+                applications.append("ai_mapped_visible_fields" if learned else "ai_found_no_new_safe_mappings")
+            elif proposal.next_action == "inspect_embedded_form":
+                applications.append("ai_requested_embedded_form_scan")
+            elif proposal.next_action == "request_human_help":
+                applications.append("ai_identified_human_blocker")
+            elif proposal.next_action == "archive_unavailable":
+                applications.append("ai_suspected_unavailable_guardrail_not_applied")
+            else:
+                applications.append("ai_requested_deterministic_retry")
+            break
+        return history, (history[-1] if history else None), applied, "+".join(applications) or "not_applied"
+
+    def _wait_for_human_captcha(self, page: Any, result: dict[str, Any], progress: Callable[[str], None]) -> bool:
+        diagnostics = result.setdefault("diagnostics", {})
+        detected = diagnostics.setdefault("detected", {})
+        attempted = diagnostics.setdefault("attempted", {})
+        try:
+            from operator_assist import captcha_assist_enabled
+            enabled = captcha_assist_enabled()
+        except Exception:
+            enabled = False
+        detected["captcha_assist_session_enabled"] = enabled
+        detected["captcha_automatic_solving"] = False
+        attempted["captcha_completion_mode"] = "human_only"
+        if not enabled:
+            detected["captcha_assist_available"] = True
+            return False
+
+        key = str(getattr(page, "url", ""))
+        if key in self._captcha_waited:
+            return False
+        self._captcha_waited.add(key)
+        progress("waiting_for_human_captcha")
+        wait_seconds = max(30, min(900, int(os.environ.get("DATASNIPER_CAPTCHA_WAIT_SECONDS", "300"))))
+        deadline = time.monotonic() + wait_seconds
+        attempted["captcha_wait_limit_seconds"] = wait_seconds
+        while time.monotonic() < deadline:
+            try:
+                from operator_assist import captcha_assist_enabled
+                if not captcha_assist_enabled():
+                    break
+                present = bool(page.evaluate(_CAPTCHA_PRESENT_SCRIPT))
+                if not present:
+                    attempted["captcha_completed_by_human"] = True
+                    progress("captcha_completed_by_human")
+                    return True
+            except Exception as exc:
+                if not self._context_failure(exc):
+                    break
+            try:
+                page.wait_for_timeout(1000)
+            except Exception:
+                break
+        attempted["captcha_completed_by_human"] = False
+        result["detail"] = (
+            "CAPTCHA assistance was enabled, but the challenge was not completed in the visible browser window"
+        )
+        return False
+
+    def _run_form_steps(self, page: Any, supplied: dict[str, str], aliases: dict[str, Any],
+                        allowed_hosts: set[str], progress: Callable[[str], None], limit: int) -> dict[str, Any]:
+        history, proposal_record, applied, application = self._guide_page(page, aliases, allowed_hosts)
+        result = super()._run_form_steps(page, supplied, aliases, allowed_hosts, progress, limit)
+        if result.get("outcome") == "blocked" and result.get("stage") == "captcha":
+            completed = self._wait_for_human_captcha(page, result, progress)
+            if completed:
+                additional_history, additional_record, additional_applied, additional_application = self._guide_page(
+                    page, aliases, allowed_hosts,
+                )
+                history.extend(additional_history)
+                proposal_record = additional_record or proposal_record
+                applied = applied or additional_applied
+                if additional_application != "not_applied":
+                    application = (
+                        additional_application if application == "not_applied"
+                        else application + "+" + additional_application
+                    )
+                result = super()._run_form_steps(page, supplied, aliases, allowed_hosts, progress, limit)
+        if proposal_record:
+            result = self._attach_ai(
+                result, proposal_record, history, applied=applied, application=application,
+            )
+        return result
 
     def _evaluate_form(
         self,
@@ -292,6 +543,8 @@ class ResilientPlaywrightExecutor(BasePlaywrightExecutor):
         policy: str,
         progress: Callable[[str], None],
     ) -> BrowserResult:
+        self._guided_page_keys.clear()
+        self._captcha_waited.clear()
         try:
             result = super().run(job, profile, variants, policy, progress)
         except Exception as exc:
@@ -321,6 +574,33 @@ class ResilientPlaywrightExecutor(BasePlaywrightExecutor):
         if not result.page_url or result.page_url == "about:blank" or result.page_url.startswith("chrome-error://"):
             result.page_url = str(job.get("url") or result.page_url)
         return self._annotate_result(result)
+
+
+class _TraceRecordingExecutor:
+    """Delegate browser work and record whether/how the local model participated."""
+
+    def __init__(self, delegate: Any):
+        self.delegate = delegate
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.delegate, name)
+
+    def start(self) -> None:
+        self.delegate.start()
+
+    def close(self) -> None:
+        self.delegate.close()
+
+    def run(self, job: dict[str, Any], profile: dict[str, str], variants: list[dict[str, Any]],
+            policy: str, progress: Callable[[str], None]) -> BrowserResult:
+        result = self.delegate.run(job, profile, variants, policy, progress)
+        try:
+            from operator_assist import record_ai_trace
+            model = str(getattr(getattr(self.delegate, "intelligence", None), "model", ""))
+            record_ai_trace(job, result, model)
+        except Exception:
+            pass
+        return result
 
 
 class ResilientBrowserWorker(BaseBrowserWorker):
@@ -361,6 +641,7 @@ class ResilientBrowserWorker(BaseBrowserWorker):
                 observation,
             )
 
+        delegate = executor or ResilientPlaywrightExecutor()
         super().__init__(
             db_factory,
             profile_fn,
@@ -370,5 +651,5 @@ class ResilientBrowserWorker(BaseBrowserWorker):
             evidence_fn,
             audit_fn,
             labeled_diagnostic,
-            executor or ResilientPlaywrightExecutor(),
+            _TraceRecordingExecutor(delegate),
         )
