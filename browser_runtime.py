@@ -1,6 +1,7 @@
 """Background worker loop and lifecycle supervision."""
 from __future__ import annotations
 
+import json
 import os
 import socket
 import threading
@@ -10,6 +11,7 @@ from typing import Any, Callable
 
 from browser_executor import PlaywrightExecutor
 from browser_worker_core import BrowserResult, QueueStore
+from operational_log import event as operational_event
 
 
 class BrowserWorker:
@@ -31,17 +33,60 @@ class BrowserWorker:
         """Interrupt the idle poll wait when an operator schedules work."""
         self.wake_event.set()
 
+    def _worker_status(self, state: str, detail: str = "") -> None:
+        """Update live status when the configured store supports worker metadata."""
+        status_fn = getattr(self.store, "worker_status", None)
+        if status_fn:
+            status_fn(state, detail)
+
+    @staticmethod
+    def _site_detail(job: dict[str, Any], state: str = "") -> str:
+        broker = str(job.get("broker_name") or "Unknown broker").strip()
+        url = str(job.get("url") or "URL unavailable").strip()
+        suffix = f" — {state.replace('_', ' ')}" if state else ""
+        return f"Trying {broker} — {url}{suffix}"
+
+    @staticmethod
+    def _attention_payload(job: dict[str, Any], result: BrowserResult) -> str:
+        return json.dumps({
+            "request_id": job.get("request_id"),
+            "queue_id": job.get("queue_id"),
+            "broker": job.get("broker_name"),
+            "url": result.page_url or job.get("url") or "",
+            "stage": result.stage,
+            "outcome": result.outcome,
+            "reason": result.detail,
+            "diagnostics": result.diagnostics or {},
+        }, ensure_ascii=False, sort_keys=True, default=str)
+
     def run_once(self) -> bool:
         job = self.store.claim()
         if not job:
             return False
-        self.record_fn(job["request_id"], "discovery", "started", detail="Background worker claimed the job", automated=True)
+        claimed_detail = self._site_detail(job, "claimed")
+        self._worker_status("online", claimed_detail)
+        operational_event("browser_worker_claimed", claimed_detail)
+        self.record_fn(
+            job["request_id"], "discovery", "started",
+            page_url=job.get("url", ""), detail=claimed_detail, automated=True,
+        )
+
+        def report_progress(state: str) -> None:
+            detail = self._site_detail(job, state)
+            self.store.progress(job, state, detail)
+            self._worker_status("online", detail)
+            operational_event("browser_worker_progress", detail)
+
         try:
             profile = self.profile_fn()
             if not profile:
                 raise RuntimeError("Household profile is not configured")
-            result = self.executor.run(job, profile, self.variants_fn(), self.setting_fn("authorization_policy") or "ask",
-                                       lambda state: self.store.progress(job, state))
+            result = self.executor.run(
+                job, profile, self.variants_fn(), self.setting_fn("authorization_policy") or "ask",
+                report_progress,
+            )
+            if not result.page_url:
+                result.page_url = str(job.get("url") or "")
             result_diagnostics = result.diagnostics or {}
             ai_proposal = (result_diagnostics.get("detected") or {}).get("local_intelligence") or {}
             ai_attempt = result_diagnostics.get("attempted") or {}
@@ -60,25 +105,52 @@ class BrowserWorker:
                     f"{job['broker_name']}: {ai_proposal.get('next_action', 'unknown')} "
                     f"applied={str(applied).lower()} application={application}",
                 )
-            self.record_fn(job["request_id"], result.stage if result.stage in {"discovery","matching","prefill","captcha","submission","confirmation","tracking"} else "tracking",
-                           result.outcome, page_url=result.page_url, match_score=result.match_score,
-                           confirmation=result.confirmation, detail=transaction_detail, automated=True)
+            self.record_fn(
+                job["request_id"],
+                result.stage if result.stage in {
+                    "discovery", "matching", "prefill", "captcha", "submission",
+                    "confirmation", "tracking",
+                } else "tracking",
+                result.outcome, page_url=result.page_url, match_score=result.match_score,
+                confirmation=result.confirmation, detail=transaction_detail, automated=True,
+            )
             if result.screenshot:
                 self.evidence_fn(job["request_id"], result.screenshot, "background-browser.png", result.detail)
             if result.outcome in {"blocked", "needs_review", "failed"}:
-                self.diagnostic_fn(job["request_id"], job["queue_id"], result.stage, result.outcome,
-                                   result.detail, result.page_url, result.diagnostics or {})
+                self.diagnostic_fn(
+                    job["request_id"], job["queue_id"], result.stage, result.outcome,
+                    result.detail, result.page_url, result.diagnostics or {},
+                )
+                operational_event("browser_attention", self._attention_payload(job, result))
             self.store.finish(job, result)
+            self._worker_status(
+                "online",
+                f"Finished {job['broker_name']} — {result.outcome.replace('_', ' ')}; checking the next queued site",
+            )
         except Exception as exc:
             detail = f"{type(exc).__name__}: {str(exc)[:500]}"
-            result = BrowserResult("failed", "tracking", detail)
-            self.record_fn(job["request_id"], "tracking", "failed", detail=detail, automated=True)
-            self.diagnostic_fn(job["request_id"], job["queue_id"], "tracking", "failed", detail, "", {
-                "page_title": "", "headings": [], "controls": [],
-                "detected": {"worker_exception": type(exc).__name__},
-                "attempted": {"action": "run browser automation"},
-            })
+            result = BrowserResult(
+                "failed", "tracking", detail, page_url=str(job.get("url") or ""),
+                diagnostics={
+                    "page_title": "", "headings": [], "controls": [],
+                    "detected": {"worker_exception": type(exc).__name__},
+                    "attempted": {"action": "run browser automation"},
+                },
+            )
+            self.record_fn(
+                job["request_id"], "tracking", "failed", page_url=result.page_url,
+                detail=detail, automated=True,
+            )
+            self.diagnostic_fn(
+                job["request_id"], job["queue_id"], "tracking", "failed", detail, result.page_url,
+                result.diagnostics,
+            )
+            operational_event("browser_attention", self._attention_payload(job, result))
             self.store.finish(job, result)
+            self._worker_status(
+                "online",
+                f"Failed {job['broker_name']} — {result.page_url or 'URL unavailable'} — {detail[:250]}",
+            )
         return True
 
     def run_forever(self) -> None:
@@ -99,6 +171,11 @@ class BrowserWorker:
             try:
                 self.store.worker_status("failed", detail)
                 self.audit_fn("browser_worker_failed", detail)
+                operational_event("browser_attention", json.dumps({
+                    "stage": "worker_lifecycle",
+                    "outcome": "failed",
+                    "reason": detail,
+                }, sort_keys=True))
             except Exception:
                 raise RuntimeError(detail) from exc
         finally:

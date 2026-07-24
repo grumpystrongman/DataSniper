@@ -59,7 +59,7 @@ def initialize_queue(path: Path) -> None:
         "Page.goto: net::ERR_INVALID_URL",
     ],
 )
-def test_bad_or_missing_url_is_removed_from_active_work_immediately(tmp_path, detail):
+def test_bad_or_missing_url_remains_visible_for_operator_review(tmp_path, detail):
     database = tmp_path / "queue.db"
     initialize_queue(database)
 
@@ -68,7 +68,13 @@ def test_bad_or_missing_url_is_removed_from_active_work_immediately(tmp_path, de
 
     store = QueueStore(db_factory, "test-worker")
     store.finish(
-        {"queue_id": 1, "request_id": 1, "attempts": 0},
+        {
+            "queue_id": 1,
+            "request_id": 1,
+            "attempts": 0,
+            "broker_name": "Gone Broker",
+            "url": "https://gone.invalid/privacy",
+        },
         BrowserResult("failed", "navigation", detail),
     )
 
@@ -83,10 +89,49 @@ def test_bad_or_missing_url_is_removed_from_active_work_immediately(tmp_path, de
             "SELECT COUNT(*) FROM runner_queue WHERE status IN ('queued','running')"
         ).fetchone()[0]
 
-    assert dict(request) == {"status": "not_found", "automation_status": "not_applicable"}
-    assert queue["status"] == "cancelled"
-    assert queue["stage"] == "archived"
-    assert queue["last_error"].startswith("Archived:")
-    assert "Not addressed" in queue["last_error"]
+    assert dict(request) == {"status": "prepared", "automation_status": "failed"}
+    assert queue["status"] == "failed"
+    assert queue["stage"] == "navigation"
+    assert "Gone Broker" in queue["last_error"]
+    assert "https://gone.invalid/privacy" in queue["last_error"]
+    assert detail in queue["last_error"]
     assert active == 0
     assert store.claim() is None
+
+
+def test_legacy_auto_archived_url_is_restored(tmp_path):
+    database = tmp_path / "queue.db"
+    initialize_queue(database)
+
+    def db_factory():
+        return database_factory(database)
+
+    automatic = (
+        "Archived: Not addressed because official URL is unavailable — "
+        "Gone Broker — https://gone.invalid/privacy — Page.goto: net::ERR_NAME_NOT_RESOLVED"
+    )
+    with db_factory() as conn:
+        conn.execute(
+            "UPDATE requests SET status='not_found',automation_status='not_applicable' WHERE id=1"
+        )
+        conn.execute(
+            """UPDATE runner_queue SET status='cancelled',stage='archived',worker_id=NULL,
+            finished_at=?,last_error=? WHERE id=1""",
+            (_now(), automatic),
+        )
+
+    store = QueueStore(db_factory, "test-worker")
+    assert store.recover_stale() == 0
+
+    with db_factory() as conn:
+        request = conn.execute(
+            "SELECT status,automation_status FROM requests WHERE id=1"
+        ).fetchone()
+        queue = conn.execute(
+            "SELECT status,stage,last_error FROM runner_queue WHERE id=1"
+        ).fetchone()
+
+    assert dict(request) == {"status": "prepared", "automation_status": "failed"}
+    assert queue["status"] == "failed"
+    assert queue["stage"] == "navigation"
+    assert queue["last_error"] == automatic
