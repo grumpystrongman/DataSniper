@@ -7,8 +7,10 @@ from browser_worker_core import (
     TERMINAL_QUEUE_STATES, BrowserResult, QueueStore, _now, form_profile,
 )
 
-# Importing registers the session-only operator-assist API routes on the FastAPI app.
+# Importing registers session-only operator-assist routes and installs the
+# mutually exclusive Automation Center funnel before the service accepts work.
 import operator_assist as _operator_assist  # noqa: F401,E402
+import automation_funnel as _automation_funnel  # noqa: F401,E402
 
 BrowserWorker = ResilientBrowserWorker
 

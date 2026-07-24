@@ -35,12 +35,13 @@
     <span class="muted">Service state: <strong id="worker-state">{{ overview.worker.state.replace('_',' ') }}</strong> · <span id="worker-elapsed">{% if overview.worker.phase_age_seconds is not none %}{{ overview.worker.phase_age_seconds }}s in this phase · {% endif %}</span>checked <span id="worker-checked">now</span></span>
   </div>
   <div class="grid">
-    <div><div class="metric">{{ overview.full }}</div><div class="muted">fully automated</div></div>
-    <div><div class="metric">{{ overview.assisted }}</div><div class="muted">assisted</div></div>
-    <div><div class="metric">{{ overview.manual }}</div><div class="muted">manual-only</div></div>
-    <div><div class="metric">{{ overview.queue }}</div><div class="muted">queued</div></div>
-    <div><div class="metric">{{ overview.attention }}</div><div class="muted">need attention</div></div>
+    <div><div class="metric" data-count="open">{{ overview.group_counts.get('open', 0) }}</div><div class="muted">open funnel</div></div>
+    <div><div class="metric" data-count="running">{{ overview.group_counts.get('running', 0) }}</div><div class="muted">running now</div></div>
+    <div><div class="metric" data-count="ready">{{ overview.group_counts.get('ready', 0) }}</div><div class="muted">queued</div></div>
+    <div><div class="metric" data-count="attention">{{ overview.group_counts.get('attention', 0) }}</div><div class="muted">need attention</div></div>
+    <div><div class="metric" data-count="unreachable">{{ overview.group_counts.get('unreachable', 0) }}</div><div class="muted">URL unavailable</div></div>
   </div>
+  <p class="muted">Automation support inventory: {{ overview.full }} fully automated · {{ overview.assisted }} assisted · {{ overview.manual }} manual-only. The funnel counts above are mutually exclusive and update from each broker's latest state.</p>
 </div>
 <div class="card" id="operator-assist-card">
   <h2>Local AI guidance and CAPTCHA session permission</h2>
@@ -60,34 +61,38 @@
   'running': ('Running now', 'The background browser is actively inspecting or submitting these requests.'),
   'ready': ('Ready and queued', 'Authorized work waiting for the background worker.'),
   'waiting': ('Waiting on broker', 'Submitted requests awaiting confirmation or completion.'),
-  'failed': ('Failed or retry needed', 'Work that stopped with a recorded reason.'),
+  'failed': ('Failed or retry needed', 'Work that stopped for a potentially recoverable reason.'),
+  'unreachable': ('URL unavailable', 'Official removal pages that could not be reached, were retired, or have a broken endpoint. Review and archive these separately.'),
   'completed': ('Completed', 'Confirmed removals and requests that do not apply.'),
   'not_started': ('Not started', 'Known brokers that have not entered the automation queue.')
 } %}
+{% set group_order = ['attention','running','ready','waiting','failed','unreachable','completed','not_started'] %}
 <div class="card" id="work-queues">
   <h2>Work queues — Broker automation matrix</h2>
-  <p class="muted">Filter by the next action, select the visible items, then run automation or move them to your manual queue.</p>
+  <p class="muted">The Open funnel excludes completed work and unreachable URLs so you can keep reducing the remaining workable set. Use URL unavailable to review and archive broken or retired endpoints.</p>
   {% if request.query_params.get('bulk_error') %}
   <div class="notice" id="selection-error" role="alert" tabindex="-1">{{ request.query_params.get('bulk_error') }}</div>
   {% else %}
   <div class="notice" id="selection-error" role="alert" tabindex="-1" hidden>Select at least one item before applying an action.</div>
   {% endif %}
   <div class="filter-bar" aria-label="Filter automation work">
-    <button type="button" class="secondary filter-button active" data-filter="all">All (<span data-count="all">{{ overview["items"]|length }}</span>)</button>
-    {% for key in ['attention','running','ready','waiting','failed','completed','not_started'] %}
-    <button type="button" class="secondary filter-button" data-filter="{{ key }}">{{ group_labels[key][0] }} (<span data-count="{{ key }}">{{ overview.group_counts[key] }}</span>)</button>
+    <button type="button" class="secondary filter-button active" data-filter="open">Open funnel (<span data-count="open">{{ overview.group_counts.get('open', 0) }}</span>)</button>
+    <button type="button" class="secondary filter-button" data-filter="all">All records (<span data-count="all">{{ overview.group_counts.get('all', overview['items']|length) }}</span>)</button>
+    {% for key in group_order %}
+    <button type="button" class="secondary filter-button" data-filter="{{ key }}">{{ group_labels[key][0] }} (<span data-count="{{ key }}">{{ overview.group_counts.get(key, 0) }}</span>)</button>
     {% endfor %}
   </div>
-  {% for key in ['attention','running','ready','waiting','failed','completed','not_started'] %}
+  {% for key in group_order %}
   {% set meta = group_labels[key] %}
-  <details data-group="{{ key }}" {% if key in ['attention','running','ready'] and overview.groups[key] %}open{% endif %}>
-    <summary><strong>{{ meta[0] }}</strong> <span class="status">{{ overview.group_counts[key] }}</span><br><span class="muted">{{ meta[1] }}</span></summary>
-    {% if overview.groups[key] %}
+  {% set group_items = overview.groups.get(key, []) %}
+  <details data-group="{{ key }}" {% if key in ['attention','running','ready'] and group_items %}open{% endif %}>
+    <summary><strong>{{ meta[0] }}</strong> <span class="status" data-count="{{ key }}">{{ overview.group_counts.get(key, 0) }}</span><br><span class="muted">{{ meta[1] }}</span></summary>
+    {% if group_items %}
     <div class="actions" style="margin:12px 0">
       <button class="secondary select-group" type="button" data-select-group="{{ key }}">Select all in {{ meta[0] }}</button>
     </div>
     {% endif %}
-    {% for item in overview.groups[key] %}
+    {% for item in group_items %}
   <div class="task-row"><input class="item-check" form="bulk-form" type="checkbox" name="request_ids" value="{{ item.id }}" aria-label="Select {{ item.broker_name }}">
     <div class="details"><strong>{{ item.broker_name }}</strong><br>
       <span class="status">{{ item.support_level or 'manual' }}</span>
@@ -98,7 +103,7 @@
     </div>
     <div class="actions">
       <a class="button secondary" href="/task/{{ item.id }}">Review history</a>
-      {% if key in ['attention','failed'] %}
+      {% if key in ['attention','failed','unreachable'] %}
       <form method="post" action="/automation/request/{{ item.id }}/retry"><button type="submit">Retry now</button></form>
       {% endif %}
       <form method="post" action="/automation/{{ item.broker_slug }}/authorization">
@@ -183,6 +188,14 @@
   const checks=[...document.querySelectorAll('.item-check')];
   const visibleChecks=()=>[...document.querySelectorAll('.item-check')].filter(el=>el.closest('details').style.display!=='none');
   const selectionError=document.querySelector('#selection-error');
+  let activeFilter='open';
+  const applyFilter=()=>{
+    groups.forEach(group=>{
+      const key=group.dataset.group;
+      const show=activeFilter==='all'||key===activeFilter||(activeFilter==='open'&&!['completed','unreachable'].includes(key));
+      group.style.display=show?'':'none';
+    });
+  };
   const update=()=>{
     document.querySelector('#selected-count').textContent=document.querySelectorAll('.item-check:checked').length;
     if(document.querySelector('.item-check:checked'))selectionError.hidden=true;
@@ -190,8 +203,10 @@
   document.querySelectorAll('.filter-button').forEach(button=>button.addEventListener('click',()=>{
     document.querySelectorAll('.filter-button').forEach(item=>item.classList.remove('active'));
     button.classList.add('active');
-    groups.forEach(group=>{group.style.display=button.dataset.filter==='all'||group.dataset.group===button.dataset.filter?'':'none'});
+    activeFilter=button.dataset.filter;
+    applyFilter();
   }));
+  applyFilter();
   checks.forEach(check=>check.addEventListener('change',update));
   document.querySelector('#select-all').addEventListener('click',()=>{checks.forEach(check=>check.checked=true);update()});
   document.querySelector('#select-visible').addEventListener('click',()=>{visibleChecks().forEach(check=>check.checked=true);update()});
@@ -336,7 +351,9 @@
       } else {
         renderHealth(`Background browser worker ${data.worker.state||'offline'}.`,` ${data.worker.transition_at?`Phase started ${data.worker.transition_at}. `:''}Queued work is not currently executing.${data.worker.detail?` ${data.worker.detail}.`:''}`,false);
       }
-      Object.entries(data.group_counts||{}).forEach(([key,value])=>{const el=document.querySelector(`[data-count="${key}"]`);if(el)el.textContent=value});
+      Object.entries(data.group_counts||{}).forEach(([key,value])=>{
+        document.querySelectorAll(`[data-count="${key}"]`).forEach(el=>{el.textContent=value});
+      });
       renderJobs(data.activity||[]);
     } catch(error) {
       renderHealth('Worker status unavailable.',' DataSniper could not verify the service. Check the application log or restart the container.',false);
