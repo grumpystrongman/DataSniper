@@ -318,6 +318,8 @@ class ResilientPlaywrightExecutor(BasePlaywrightExecutor):
                     "attempted": {"action": "retry after page settled"},
                 },
             )
+        if not result.page_url or result.page_url == "about:blank" or result.page_url.startswith("chrome-error://"):
+            result.page_url = str(job.get("url") or result.page_url)
         return self._annotate_result(result)
 
 
