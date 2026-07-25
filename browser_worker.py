@@ -8,9 +8,10 @@ from browser_worker_core import (
 )
 
 # Importing registers session-only operator-assist routes and installs the
-# mutually exclusive Automation Center funnel before the service accepts work.
+# Automation Center funnel plus bounded multi-page privacy-path discovery.
 import operator_assist as _operator_assist  # noqa: F401,E402
 import automation_funnel as _automation_funnel  # noqa: F401,E402
+import site_discovery as _site_discovery  # noqa: F401,E402
 
 BrowserWorker = ResilientBrowserWorker
 
